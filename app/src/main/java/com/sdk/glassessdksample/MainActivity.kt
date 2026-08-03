@@ -198,6 +198,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     
     // Gmail Service for email operations
     private var gmailService: GmailService? = null
+
+    // Email drafted by draft_email, held until confirm_send_email is called.
+    // Voice-agent sends are gated behind an explicit spoken confirmation, so the
+    // draft can't be sent by a single misheard utterance.
+    private data class PendingEmailDraft(val toEmail: String, val toLabel: String, val subject: String, val body: String)
+    private var pendingEmailDraft: PendingEmailDraft? = null
     
     // Quick Notes Manager for storing notes and AI reminders
     private var notesManager: QuickNotesManager? = null
@@ -3456,7 +3462,43 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         Log.w(TAG, "❌ No contact found for: $name")
         return null
     }
-    
+
+    /**
+     * Resolve a spoken recipient into an email address: if it already looks like
+     * one (contains "@"), use it as-is; otherwise look it up by contact name.
+     */
+    private fun findContactEmail(recipient: String): String? {
+        if (recipient.contains("@")) return recipient.trim()
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            return null
+        }
+
+        try {
+            val cursor = contentResolver.query(
+                ContactsContract.CommonDataKinds.Email.CONTENT_URI,
+                arrayOf(ContactsContract.CommonDataKinds.Email.ADDRESS, ContactsContract.CommonDataKinds.Email.DISPLAY_NAME),
+                "${ContactsContract.CommonDataKinds.Email.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$recipient%"),
+                null
+            )
+            cursor?.use {
+                if (it.moveToFirst()) {
+                    val addressIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Email.ADDRESS)
+                    if (addressIndex >= 0) {
+                        val address = it.getString(addressIndex)
+                        Log.d(TAG, "✅ Found email for $recipient -> $address")
+                        return address
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error searching contact emails: ${e.message}", e)
+        }
+        Log.w(TAG, "❌ No email found for contact: $recipient")
+        return null
+    }
+
     private fun makePhoneCall(phoneNumber: String, contactName: String) {
         // Check for call permission (Android 6.0+)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
@@ -6028,6 +6070,88 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         }
                         summary.toString().trim()
                     }
+                }
+
+                "read_emails" -> {
+                    val gmail = gmailService
+                    if (gmail == null || !gmail.isGmailReady()) {
+                        "Gmail isn't connected yet. Please connect your Google account in Settings first."
+                    } else {
+                        val mode = args["mode"] as? String ?: "unread_count"
+                        val limit = (args["limit"] as? Number)?.toInt() ?: 5
+                        val latch = java.util.concurrent.CountDownLatch(1)
+                        var reply = "Unable to check your inbox right now."
+                        val onResult: (String) -> Unit = { result ->
+                            reply = result
+                            latch.countDown()
+                        }
+                        if (mode == "recent") gmail.getRecentEmails(limit, onResult) else gmail.getUnreadEmailCount(onResult)
+                        latch.await(15, java.util.concurrent.TimeUnit.SECONDS)
+                        reply
+                    }
+                }
+
+                "draft_email" -> {
+                    val gmail = gmailService
+                    if (gmail == null || !gmail.isGmailReady()) {
+                        "Gmail isn't connected yet. Please connect your Google account in Settings first."
+                    } else {
+                        val recipientRaw = args["recipient"] as? String ?: return "Error: No recipient provided"
+                        val subject = args["subject"] as? String ?: "(no subject)"
+                        val body = args["body"] as? String ?: return "Error: No email body provided"
+                        val email = findContactEmail(recipientRaw)
+                        if (email == null) {
+                            pendingEmailDraft = null
+                            "I couldn't find an email address for $recipientRaw in your contacts. Ask the user for their email address."
+                        } else {
+                            pendingEmailDraft = PendingEmailDraft(email, recipientRaw, subject, body)
+                            "Draft ready: to $recipientRaw ($email), subject \"$subject\", message: \"$body\". Read this back to the user and ask if you should send it."
+                        }
+                    }
+                }
+
+                "confirm_send_email" -> {
+                    val draft = pendingEmailDraft
+                    val gmail = gmailService
+                    if (draft == null) {
+                        "There is no pending email draft to send. Use draft_email first."
+                    } else if (gmail == null || !gmail.isGmailReady()) {
+                        "Gmail isn't connected. Please connect your Google account in Settings first."
+                    } else {
+                        val latch = java.util.concurrent.CountDownLatch(1)
+                        var reply = "Failed to send the email."
+                        gmail.sendEmail(draft.toEmail, draft.subject, draft.body) { success, message ->
+                            reply = message
+                            latch.countDown()
+                        }
+                        latch.await(20, java.util.concurrent.TimeUnit.SECONDS)
+                        pendingEmailDraft = null
+                        reply
+                    }
+                }
+
+                "enter_silent_mode" -> {
+                    Log.d(TAG, "🔇 Entering silent mode (AI stays listening, stops speaking)")
+                    // Mute after a short delay so the model's brief spoken acknowledgement
+                    // ("Okay") plays before output is silenced. Input keeps streaming, so
+                    // the user can still ask to exit silent mode by voice.
+                    mainScope.launch {
+                        delay(2500)
+                        geminiLiveService?.muteOutput()
+                        runOnUiThread {
+                            Toast.makeText(this@MainActivity, "🔇 Silent mode on", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    "Silent mode is on. Acknowledge with a single short word like \"Okay\", then stop speaking until silent mode is turned off."
+                }
+
+                "exit_silent_mode" -> {
+                    Log.d(TAG, "🔊 Exiting silent mode (AI speaks again)")
+                    geminiLiveService?.unmuteOutput()
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "🔊 Silent mode off", Toast.LENGTH_SHORT).show()
+                    }
+                    "Silent mode is off. Give a short spoken confirmation that you're back and ready to help."
                 }
 
                 else -> "Unknown function: $toolName"

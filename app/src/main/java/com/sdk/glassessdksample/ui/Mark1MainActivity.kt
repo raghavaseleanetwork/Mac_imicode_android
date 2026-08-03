@@ -36,6 +36,7 @@ import com.sdk.glassessdksample.ListeningService
 import com.sdk.glassessdksample.NotificationListener
 import com.sdk.glassessdksample.R
 import com.sdk.glassessdksample.SettingsActivity
+import com.sdk.glassessdksample.wakeword.HeyImiWakeWordDetector
 import com.sdk.glassessdksample.databinding.ActivityMark1MainBinding
 import org.greenrobot.eventbus.EventBus
 import org.greenrobot.eventbus.Subscribe
@@ -69,6 +70,10 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     private val musicProgressHandler = Handler(Looper.getMainLooper())
     private val wakeWordHandler = Handler(Looper.getMainLooper())
     private var pulseAnimator: AnimatorSet? = null
+    private var wakeChimePlayer: MediaPlayer? = null
+    // Separate from wakeWordHandler: stopWakeWordListening() clears that one, which
+    // would silently cancel an in-flight BLE-gate connection poll.
+    private val bleGateHandler = Handler(Looper.getMainLooper())
 
     private var isGeminiLiveActive = false
     private var wakeWordStarted = false
@@ -78,6 +83,10 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     // that's already starting (it would otherwise stop/restart the wake-word detector
     // and even tear down an active Gemini Live session).
     private var skipNextBleGateCheck = false
+    // Set when the wake word COLD-launches this Activity (onCreate). Once the BLE
+    // gate passes we auto-start the conversation so the user can talk to the AI
+    // right away, exactly as if the app had already been open.
+    private var pendingWakeConversation = false
 
     private val conversationHistory = mutableListOf<Pair<String, String>>()
     private val gson = Gson()
@@ -111,6 +120,7 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         binding = ActivityMark1MainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -130,6 +140,15 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         setupBottomNav()
         preWarmWakeWord()
         checkAndRequestPermissions()
+
+        // If the OS had destroyed this Activity while backgrounded, the wake word
+        // cold-launches it here (onCreate) rather than onNewIntent. Remember that
+        // so we auto-start the conversation once the BLE gate passes — otherwise
+        // the wake word "fires" but the user can never talk to the AI.
+        if (intent?.action == ListeningService.ACTION_WAKE_WORD_DETECTED) {
+            pendingWakeConversation = true
+        }
+
         checkBleAndShowGate()
     }
 
@@ -140,15 +159,15 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
      */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         if (intent.action == ListeningService.ACTION_WAKE_WORD_DETECTED) {
+            // Don't start the conversation here — onNewIntent runs BEFORE onResume,
+            // and when the phone is locked the window/audio route isn't ready yet,
+            // so the chime and mic silently fail. Instead flag it and let the
+            // wake-conversation kick off from onResume, once the Activity is truly
+            // foregrounded (over the lock screen) and audio can route correctly.
+            pendingWakeConversation = true
             skipNextBleGateCheck = true
-            // Trigger the conversation directly instead of re-posting to EventBus:
-            // ListeningService is also subscribed to BluetoothEvent and would react to
-            // a re-posted "wake up" by calling startActivity() again, which re-enters
-            // onNewIntent and posts again — an infinite wake-word loop.
-            if (!isGeminiLiveActive && !isAiMuted) {
-                playChimeThenStartConversation()
-            }
         }
     }
 
@@ -171,9 +190,37 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         binding.bottomNavigation.selectedItemId = R.id.nav_home
         if (skipNextBleGateCheck) {
             skipNextBleGateCheck = false
+            // Warm wake path: the Activity was alive in the background, so the BLE
+            // gate is already hidden. If the wake word brought us here, start the
+            // conversation now that we're resumed (window up, audio can route).
+            maybeStartPendingWakeConversation()
         } else {
             checkBleAndShowGate()
         }
+    }
+
+    /**
+     * Starts the conversation that the wake word requested, but only once the
+     * Activity is truly resumed and (for Mark 1) the glasses are connected. Called
+     * from both the warm path (onResume) and the cold path (hideBleGate). Runs on a
+     * short post so the window is fully up — important when we came up over the lock
+     * screen, where an immediate chime/mic grab would otherwise be dropped.
+     */
+    private fun maybeStartPendingWakeConversation() {
+        if (!pendingWakeConversation) return
+        pendingWakeConversation = false
+        if (isAiMuted || isGeminiLiveActive) return
+        if (!isGlassConnected()) {
+            // No glasses → assistant is gated off; show the gate instead.
+            checkBleAndShowGate()
+            return
+        }
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (!isGeminiLiveActive && !isAiMuted) {
+                Log.i(TAG, "🎙️ Starting wake-word conversation (background/locked path)")
+                playChimeThenStartConversation()
+            }
+        }, 350)
     }
 
     override fun onPause() {
@@ -187,13 +234,21 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     override fun onDestroy() {
         super.onDestroy()
         wakeWordHandler.removeCallbacksAndMessages(null)
+        bleGateHandler.removeCallbacksAndMessages(null)
         tts?.stop()
         tts?.shutdown()
         itunesMediaPlayer?.release()
+        wakeChimePlayer?.release()
+        wakeChimePlayer = null
         musicProgressHandler.removeCallbacksAndMessages(null)
         pulseAnimator?.cancel()
         geminiLiveService?.stopLiveConversation()
-        HotHelper.getInstance(applicationContext).stop()
+        // NOTE: Do NOT stop HotHelper here. Wake-word listening is owned by the
+        // foreground ListeningService so it keeps running when this Activity is
+        // backgrounded or reclaimed by the OS (screen off / locked / minimised).
+        // The listener is only stopped via the notification's "Stop" action, when
+        // the glasses disconnect (BLE gate), or when the AI is muted — all of which
+        // go through stopWakeWordListening() and tell the service to stop too.
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -227,6 +282,18 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun checkBleAndShowGate() {
+        // Seamless hand-back: if a conversation started while the phone was locked is
+        // still running, turning the screen on must NOT tear it down. Skip the gate
+        // entirely and just show the live conversation UI instead.
+        if (ListeningService.isBackgroundConversationActive()) {
+            Log.i(TAG, "🔗 Background conversation in progress — skipping BLE gate, adopting session")
+            adoptBackgroundConversationUi()
+            return
+        }
+
+        // Cancel any poll from a previous gate pass so they can't race each other.
+        bleGateHandler.removeCallbacksAndMessages(null)
+
         binding.layoutBleGate.visibility = View.VISIBLE
         binding.layoutBleChecking.visibility = View.VISIBLE
         binding.layoutBleNotConnected.visibility = View.GONE
@@ -239,22 +306,115 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         if (isGeminiLiveActive) stopConversation()
         stopWakeWordListening()
 
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (isGlassConnected()) {
-                hideBleGate()
-            } else {
-                binding.layoutBleChecking.visibility = View.GONE
-                binding.layoutBleNotConnected.visibility = View.VISIBLE
-            }
-        }, 800)
+        // Poll briefly instead of sampling once: the glasses' profiles can take a
+        // moment to register after the app opens, and a single 800ms check would
+        // wrongly show "not connected" for an already-paired, connected pair.
+        pollForGlassConnection(attempt = 0)
     }
 
+    /** Re-checks the connection a few times before declaring the glasses absent. */
+    private fun pollForGlassConnection(attempt: Int) {
+        val maxAttempts = 6      // ~3s total
+        val intervalMs = 500L
+
+        bleGateHandler.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
+            when {
+                isGlassConnected() -> {
+                    Log.i(TAG, "✅ Glasses detected on attempt ${attempt + 1}")
+                    hideBleGate()
+                }
+                attempt + 1 < maxAttempts -> pollForGlassConnection(attempt + 1)
+                else -> {
+                    Log.i(TAG, "❌ Glasses not detected after $maxAttempts attempts")
+                    binding.layoutBleChecking.visibility = View.GONE
+                    binding.layoutBleNotConnected.visibility = View.VISIBLE
+                }
+            }
+        }, intervalMs)
+    }
+
+    /**
+     * The user turned the screen on while a phone-locked conversation was running.
+     * Show the live conversation UI and leave the session completely untouched — the
+     * background service still owns the mic/WebSocket, so the chat continues without
+     * a break. When it ends, the service re-arms the wake word as usual.
+     */
+    private fun adoptBackgroundConversationUi() {
+        binding.layoutBleGate.visibility = View.GONE
+        binding.bottomNavigation.visibility = View.VISIBLE
+        binding.cardConversation.visibility = View.VISIBLE
+        binding.tvConversationStatus.text = "🎤 Listening…"
+        binding.btnQuickStart.text = "Stop Listening"
+        startPulseAnimation()
+    }
+
+    /**
+     * True when the glasses are connected by ANY meaningful transport.
+     *
+     * The old check only looked at the HFP/HEADSET profile, but Mark 1 connects over
+     * BLE (GATT) for data and only registers on HFP once voice audio (SCO) is
+     * actually up. That made a properly-connected pair report "not connected" on the
+     * gate right after opening the app. We now accept HEADSET, A2DP or GATT, and
+     * fall back to asking the BluetoothManager which devices are really connected.
+     */
     private fun isGlassConnected(): Boolean {
         try {
             val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
             if (!adapter.isEnabled) return false
-            val hfpState = adapter.getProfileConnectionState(BluetoothProfile.HEADSET)
-            if (hfpState == BluetoothProfile.STATE_CONNECTED) return true
+
+            // 1. Classic profiles (HFP for voice, A2DP for media).
+            val profiles = intArrayOf(
+                BluetoothProfile.HEADSET,
+                BluetoothProfile.A2DP,
+                BluetoothProfile.GATT
+            )
+            for (p in profiles) {
+                val state = try {
+                    adapter.getProfileConnectionState(p)
+                } catch (_: Exception) {
+                    BluetoothProfile.STATE_DISCONNECTED
+                }
+                if (state == BluetoothProfile.STATE_CONNECTED) {
+                    Log.d(TAG, "Glasses connected (profile=$p)")
+                    return true
+                }
+            }
+
+            // 2. BLE/GATT devices the system reports as actively connected.
+            try {
+                val bm = getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+                val gattConnected = bm?.getConnectedDevices(BluetoothProfile.GATT).orEmpty() +
+                    bm?.getConnectedDevices(BluetoothProfile.GATT_SERVER).orEmpty()
+                if (gattConnected.isNotEmpty()) {
+                    Log.d(TAG, "Glasses connected (GATT devices=${gattConnected.size})")
+                    return true
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "No BLUETOOTH_CONNECT permission for GATT check: ${e.message}")
+            }
+
+            // 3. Last resort: ask each bonded device whether it is actually connected.
+            //    BluetoothDevice.isConnected() is hidden API, hence reflection. This
+            //    catches classic audio headsets (e.g. "F-16") that the profile proxy
+            //    can momentarily report as disconnected.
+            try {
+                val bonded = adapter.bondedDevices.orEmpty()
+                for (device in bonded) {
+                    val connected = try {
+                        val m = device.javaClass.getMethod("isConnected")
+                        m.invoke(device) as? Boolean ?: false
+                    } catch (_: Exception) {
+                        false
+                    }
+                    if (connected) {
+                        Log.d(TAG, "Glasses connected (bonded device reports connected)")
+                        return true
+                    }
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "No permission to read bonded devices: ${e.message}")
+            }
         } catch (e: Exception) {
             Log.w(TAG, "BLE check error: ${e.message}")
         }
@@ -262,6 +422,8 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     }
 
     private fun hideBleGate() {
+        // Stop any pending connection poll so a late callback can't re-show the gate.
+        bleGateHandler.removeCallbacksAndMessages(null)
         binding.layoutBleGate.animate()
             .alpha(0f)
             .setDuration(400)
@@ -272,6 +434,23 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
             .start()
         binding.bottomNavigation.visibility = View.VISIBLE
         startEntranceAnimations()
+
+        // Cold path: the wake word launched us from scratch (Activity had been
+        // killed). Now that glasses are confirmed connected, start the conversation
+        // instead of dropping back to idle listening — the user just said "Hey IMI".
+        if (pendingWakeConversation) {
+            pendingWakeConversation = false
+            if (!isAiMuted && !isGeminiLiveActive) {
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (!isGeminiLiveActive && !isAiMuted) {
+                        Log.i(TAG, "🎙️ Starting wake-word conversation (cold-launch path)")
+                        playChimeThenStartConversation()
+                    }
+                }, 350)
+                return
+            }
+        }
+
         if (!isAiMuted) startWakeWordListening()
     }
 
@@ -344,13 +523,12 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         }
 
         HotHelper.getInstance(applicationContext).apply {
-            // Mark 1 has a less sensitive mic pickup, so lower the wake-word
-            // threshold below the engine default (~0.42) to make "Hey IMI"
-            // easier to trigger. Tuned from on-device logs: ambient speech/noise
-            // tops out around smooth≈0.22, while a real "Hey IMI" lands at
-            // smooth≈0.39 — so 0.27 sits in the gap (easy to trigger, low false
-            // positives).
-            setThreshold(0.27f)
+            // Use the SAME threshold as the iOS app (0.55). With the iOS model
+            // (imi_cnn_mobile.onnx) a real "Hey IMI" scores 0.85–0.99 while
+            // ambient speech/noise stays below ~0.53, so 0.55 sits cleanly in
+            // the gap. (The old 0.27 was tuned for the previous, weaker model
+            // whose positives only reached ≈0.39 — do NOT reintroduce it.)
+            setThreshold(HeyImiWakeWordDetector.DEFAULT_THRESHOLD) // 0.55, matches iOS
             start()
         }
     }
@@ -359,6 +537,17 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         wakeWordHandler.removeCallbacksAndMessages(null)
         wakeWordStarted = false
         HotHelper.getInstance(applicationContext).stop()
+        // The foreground ListeningService owns the detector for background
+        // operation, so tell it to stop too — otherwise it would keep listening
+        // (and holding the mic + wake-lock) after the glasses disconnect / AI mute.
+        try {
+            val stopIntent = Intent(this, ListeningService::class.java).apply {
+                action = ListeningService.ACTION_STOP
+            }
+            startService(stopIntent)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not stop ListeningService: ${e.message}")
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -367,17 +556,48 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
 
     private fun playChimeThenStartConversation() {
         stopWakeWordListening()
+
+        // Guarantee the conversation starts exactly once, even if the chime fails
+        // to play or its completion callback never fires (which is what happened on
+        // a locked screen — the old code also mis-set the stream type AFTER
+        // MediaPlayer.create()/prepare(), which threw and silently swallowed the
+        // conversation start). A short watchdog is the backstop.
+        val started = java.util.concurrent.atomic.AtomicBoolean(false)
+        val startOnce = {
+            if (started.compareAndSet(false, true)) startInlineGeminiLive()
+        }
+        // Backstop: if the chime hasn't handed off within 1.2s, start anyway.
+        Handler(Looper.getMainLooper()).postDelayed({ startOnce() }, 1_200)
+
         try {
-            val mp = MediaPlayer.create(this, R.raw.bmw_warning_chime)
-            mp?.setAudioStreamType(AudioManager.STREAM_MUSIC)
-            mp?.setOnCompletionListener { player ->
-                player.release()
-                startInlineGeminiLive()
+            val mp = MediaPlayer().apply {
+                setAudioAttributes(
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                val afd = resources.openRawResourceFd(R.raw.bmw_warning_chime)
+                setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                afd.close()
+                setVolume(1f, 1f)
+                setOnCompletionListener { player ->
+                    player.release()
+                    startOnce()
+                }
+                setOnErrorListener { player, _, _ ->
+                    player.release()
+                    startOnce()
+                    true
+                }
+                prepare()
+                start()
             }
-            mp?.start()
+            wakeChimePlayer?.release()
+            wakeChimePlayer = mp
         } catch (e: Exception) {
             Log.w(TAG, "Chime failed: ${e.message}")
-            startInlineGeminiLive()
+            startOnce()
         }
     }
 
@@ -414,6 +634,18 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         // End the current session so the next conversation is grouped separately.
         currentSessionId = null
         geminiLiveService?.stopLiveConversation()
+        // Also end a conversation that was started by the background service (e.g. the
+        // user woke IMI with the phone locked, then turned the screen on and tapped Stop).
+        if (ListeningService.isBackgroundConversationActive()) {
+            try {
+                startService(
+                    Intent(this, ListeningService::class.java)
+                        .apply { action = ListeningService.ACTION_STOP_BG_CONVERSATION }
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not stop background conversation: ${e.message}")
+            }
+        }
         stopPulseAnimation()
 
         runOnUiThread {
@@ -616,7 +848,19 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         }
 
         binding.btnBleGateRetry.setOnClickListener {
-            checkBleAndShowGate()
+            // If BLUETOOTH_CONNECT is still missing we literally cannot see the
+            // glasses, so ask for it again rather than re-running a check that is
+            // guaranteed to fail.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    this, arrayOf(Manifest.permission.BLUETOOTH_CONNECT), REQUEST_PERMISSIONS
+                )
+            } else {
+                checkBleAndShowGate()
+            }
         }
 
         binding.btnBleGateInfo.setOnClickListener {
@@ -1109,11 +1353,20 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
 
     private fun checkAndRequestPermissions() {
         val needed = mutableListOf<String>()
-        val perms = arrayOf(
+        val perms = mutableListOf(
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.READ_CONTACTS,
-            Manifest.permission.CALL_PHONE
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.SEND_SMS
         )
+        // Android 12+ gates ALL Bluetooth queries behind BLUETOOTH_CONNECT. Without
+        // it, getProfileConnectionState() reports DISCONNECTED and getConnectedDevices()
+        // throws — so the BLE gate showed "no device connected" even with the glasses
+        // plainly connected. (Mark 2 already requested this; Mark 1 never did.)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            perms.add(Manifest.permission.BLUETOOTH_CONNECT)
+            perms.add(Manifest.permission.BLUETOOTH_SCAN)
+        }
         perms.forEach {
             if (ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED) {
                 needed.add(it)
@@ -1121,6 +1374,29 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         }
         if (needed.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, needed.toTypedArray(), REQUEST_PERMISSIONS)
+        }
+    }
+
+    /**
+     * Re-run the BLE gate once permissions come back. Granting BLUETOOTH_CONNECT is
+     * what makes the glasses actually visible to us, so without this the gate would
+     * stay stuck on "no device connected" until the user restarted the app.
+     */
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_PERMISSIONS) {
+            val btGranted = permissions.indices.any { i ->
+                permissions[i] == Manifest.permission.BLUETOOTH_CONNECT &&
+                    grantResults.getOrNull(i) == PackageManager.PERMISSION_GRANTED
+            }
+            if (btGranted) {
+                Log.i(TAG, "BLUETOOTH_CONNECT granted — re-checking glasses connection")
+                checkBleAndShowGate()
+            }
         }
     }
 }

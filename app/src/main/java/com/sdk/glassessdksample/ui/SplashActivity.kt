@@ -64,12 +64,20 @@ class SplashActivity : AppCompatActivity() {
                         Intent(this, DeviceSelectionActivity::class.java)
                     }
                 }
+                // Clear any restored task (e.g. a Mark 2 MainActivity left over from a
+                // previous run) so launching the app ALWAYS lands on the select-device
+                // screen instead of resuming the last-used device's home screen.
+                intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
                 startActivity(intent)
                 finish()
             } catch (e: Exception) {
                 e.printStackTrace()
-                // Fallback to MainActivity if something fails
-                val fallbackIntent = Intent(this, com.sdk.glassessdksample.MainActivity::class.java)
+                // Fall back to device selection — NEVER to a device home screen.
+                // (This previously fell back to Mark 2's MainActivity, which meant any
+                // stray exception here silently skipped the select-device screen.)
+                val fallbackIntent = Intent(this, DeviceSelectionActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                }
                 startActivity(fallbackIntent)
                 finish()
             }

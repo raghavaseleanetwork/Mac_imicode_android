@@ -253,12 +253,12 @@ class HotHelper private constructor(private val context: Context) {
             configuredThreshold?.let { heyImiDetector?.setThreshold(it) }
             
             Log.i(TAG, "✅ ONNX Detector initialized successfully")
-            Log.i(TAG, "   📦 Model: custom_wakeword/imi_cnn.onnx")
+            Log.i(TAG, "   📦 Model: custom_wakeword/imi_cnn_mobile.onnx")
             Log.i(TAG, "   🎯 Threshold: ${heyImiDetector?.getThreshold()}")
             return true
         } catch (e: Exception) {
             Log.e(TAG, "❌ Failed to initialize ONNX detector: ${e.message}", e)
-            Log.e(TAG, "   Check assets/custom_wakeword/imi_cnn.onnx exists and onnxruntime dependency is present")
+            Log.e(TAG, "   Check assets/custom_wakeword/imi_cnn_mobile.onnx exists and onnxruntime dependency is present")
             heyImiDetector = null
             return false
         }
@@ -305,25 +305,10 @@ class HotHelper private constructor(private val context: Context) {
             BluetoothEvent(BluetoothEvent.EventType.VOICE_TEXT, "wake up")
         )
 
-        // If the home Activity is not in the foreground (EventBus unregisters on onStop),
-        // bring it back directly so the conversation can start even when minimised / screen off.
-        if (!EventBus.getDefault().hasSubscriberForEvent(BluetoothEvent::class.java)) {
-            val targetActivity = if (DevicePreferenceManager.getDeviceType(context) == DeviceType.MARK1) {
-                Mark1MainActivity::class.java
-            } else {
-                MainActivity::class.java
-            }
-            Log.i(TAG, "📲 No EventBus subscriber — launching ${targetActivity.simpleName} from background")
-            try {
-                val intent = Intent(context, targetActivity).apply {
-                    action = ListeningService.ACTION_WAKE_WORD_DETECTED
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                }
-                context.startActivity(intent)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to launch ${targetActivity.simpleName} from background: ${e.message}")
-            }
-        }
+        // NOTE: We deliberately do NOT startActivity() here any more. When the app is
+        // in the background the conversation is run by ListeningService (which is
+        // subscribed to this same event), so the phone is never forced open / unlocked.
+        // The user talks to IMI through the glasses with the phone left as-is.
     }
 
     /**

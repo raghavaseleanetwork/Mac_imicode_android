@@ -406,6 +406,61 @@
                 </LinearLayout>
             </androidx.cardview.widget.CardView>
 
+            <!-- Connected Accounts card: Gmail agent authorization -->
+            <androidx.cardview.widget.CardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                app:cardBackgroundColor="#1A1A1A"
+                app:cardCornerRadius="16dp"
+                app:cardElevation="0dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="18dp">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Connected Accounts"
+                        android:textColor="#FFFFFF"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:layout_marginBottom="4dp" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Let Imi send emails and read your inbox on your behalf"
+                        android:textColor="#88FFFFFF"
+                        android:textSize="11sp"
+                        android:layout_marginBottom="14dp" />
+
+                    <TextView
+                        android:id="@+id/tvGmailStatus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Not connected"
+                        android:textColor="#AAFFFFFF"
+                        android:textSize="12sp"
+                        android:layout_marginBottom="10dp" />
+
+                    <Button
+                        android:id="@+id/btnConnectGmail"
+                        android:layout_width="match_parent"
+                        android:layout_height="52dp"
+                        android:background="@drawable/bg_home_btn_orange"
+                        android:text="Connect Gmail"
+                        android:textAllCaps="false"
+                        android:textColor="#FFFFFF"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:stateListAnimator="@null" />
+                </LinearLayout>
+            </androidx.cardview.widget.CardView>
+
             <!-- HIDDEN VIEWS kept for SettingsActivity code compatibility -->
             <TextView
                 android:id="@+id/tvCurrentPlan"

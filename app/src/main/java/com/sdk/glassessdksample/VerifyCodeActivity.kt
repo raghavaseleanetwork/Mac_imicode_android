@@ -115,8 +115,9 @@ class VerifyCodeActivity : AppCompatActivity() {
         val sharedPreferences = getSharedPreferences("IMI_PREFS", MODE_PRIVATE)
         sharedPreferences.edit().putBoolean("is_logged_in", true).apply()
         
-        // Onboarding screen hidden: go straight to the main screen.
-        val intent = Intent(this, MainActivity::class.java)
+        // After login the user must ALWAYS pick their device first — never drop
+        // them straight onto a device home screen (this used to jump to Mark 2).
+        val intent = Intent(this, com.sdk.glassessdksample.ui.DeviceSelectionActivity::class.java)
         intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         startActivity(intent)
         finish()

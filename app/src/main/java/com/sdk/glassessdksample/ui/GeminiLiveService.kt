@@ -130,6 +130,21 @@ class GeminiLiveService(
         private const val GEMINI_VOICE = "Kore"
         private const val GEMINI_INPUT_SAMPLE_RATE = 16000
         private const val GEMINI_OUTPUT_SAMPLE_RATE = 24000
+
+        /**
+         * SPLIT BLUETOOTH AUDIO — mic over SCO, playback over A2DP.
+         *
+         * Bluetooth only exposes a microphone in SCO/HFP mode, which is mono
+         * 8–16 kHz "phone call" quality. Routing playback through SCO as well made
+         * the glasses sound low/muffled. With this enabled we keep capturing the mic
+         * over SCO but pin the AI's voice to the A2DP device, which carries the full
+         * 24 kHz output, and use MODE_IN_COMMUNICATION so media isn't forced into the
+         * telephony path.
+         *
+         * Set to false to restore the previous SCO-only behaviour if a particular
+         * headset stutters or drops out with split routing.
+         */
+        private const val HIGH_QUALITY_PLAYBACK = true
         
         // Echo cancellation and noise suppression
         private const val ENERGY_THRESHOLD = 200.0
@@ -621,9 +636,17 @@ class GeminiLiveService(
     // ========== OPTION A: Use System Bluetooth for Audio ==========
     // BLE handles data (photos, commands) - System Bluetooth handles audio
     
-    // 1. Set audio mode to IN_CALL for automatic Bluetooth routing
-    audioManager?.mode = AudioManager.MODE_IN_CALL
-    Log.d(TAG, "📞 Audio mode: IN_CALL (enables automatic Bluetooth routing)")
+    // 1. Audio mode.
+    //    MODE_IN_CALL puts the whole device into telephony mode, which forces every
+    //    stream through the narrowband SCO path — that is a big part of why the
+    //    glasses sounded muffled. MODE_IN_COMMUNICATION still gives us SCO mic
+    //    capture but leaves media playback free to use high-quality A2DP.
+    audioManager?.mode = if (HIGH_QUALITY_PLAYBACK) {
+        AudioManager.MODE_IN_COMMUNICATION
+    } else {
+        AudioManager.MODE_IN_CALL
+    }
+    Log.d(TAG, "📞 Audio mode: ${if (HIGH_QUALITY_PLAYBACK) "IN_COMMUNICATION (A2DP playback allowed)" else "IN_CALL"}")
     
     // 2. Check if Bluetooth audio is available
     val isBluetoothAvailable = audioManager?.isBluetoothScoAvailableOffCall == true
@@ -753,20 +776,36 @@ class GeminiLiveService(
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
-        // 9. Route AudioTrack output to the Bluetooth SCO device explicitly.
-        //    Without this, Android may send audio to the phone speaker on the 2nd+
-        //    session because USAGE_MEDIA doesn't automatically follow SCO re-routes.
+        // 9. Route AudioTrack output.
+        //
+        //    SPLIT AUDIO (HIGH_QUALITY_PLAYBACK=true): the mic keeps using Bluetooth
+        //    SCO (the only Bluetooth mode with a microphone), but PLAYBACK is pinned
+        //    to the A2DP device instead. SCO is mono 8–16 kHz call-quality, which is
+        //    why the glasses sounded muffled/low; A2DP carries the full 24 kHz Gemini
+        //    output. USAGE_MEDIA (set above) is what makes A2DP eligible at all.
+        //
+        //    Set HIGH_QUALITY_PLAYBACK=false to fall back to the old SCO-only routing
+        //    if split routing causes dropouts on a particular headset.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             try {
                 val outputDevices = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: arrayOf()
-                val btOutputDevice = outputDevices.firstOrNull {
+
+                val a2dpDevice = outputDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                }
+                val scoDevice = outputDevices.firstOrNull {
                     it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
                 }
-                if (btOutputDevice != null) {
-                    val success = audioTrack?.setPreferredDevice(btOutputDevice)
-                    Log.d(TAG, "🎯 AudioTrack preferred output → ${btOutputDevice.productName}, success=$success")
+
+                val chosen = if (HIGH_QUALITY_PLAYBACK && a2dpDevice != null) a2dpDevice else scoDevice
+
+                if (chosen != null) {
+                    val success = audioTrack?.setPreferredDevice(chosen)
+                    val kind = if (chosen.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP)
+                        "A2DP (high quality)" else "SCO (call quality)"
+                    Log.d(TAG, "🎯 AudioTrack preferred output → ${chosen.productName} [$kind], success=$success")
                 } else {
-                    Log.d(TAG, "ℹ️ No BT SCO output device found — using system default routing")
+                    Log.d(TAG, "ℹ️ No Bluetooth output device found — using system default routing")
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to set AudioTrack preferred device: ${e.message}")
@@ -1188,6 +1227,59 @@ class GeminiLiveService(
                         "limit" to mapOf("type" to "integer", "description" to "How many recent notifications to read (default 5)")
                     )
                 )
+            ),
+            mapOf(
+                "type" to "function",
+                "name" to "read_emails",
+                "description" to "Read the user's recent Gmail inbox, or the count of unread emails. Use when the user asks 'do I have any new emails', 'read my emails', 'check my inbox', 'any mail from someone', or similar.",
+                "parameters" to mapOf(
+                    "type" to "object",
+                    "properties" to mapOf(
+                        "mode" to mapOf("type" to "string", "description" to "'unread_count' for just a count, or 'recent' to list recent emails", "enum" to listOf("unread_count", "recent")),
+                        "limit" to mapOf("type" to "integer", "description" to "How many recent emails to read when mode is 'recent' (default 5)")
+                    )
+                )
+            ),
+            mapOf(
+                "type" to "function",
+                "name" to "draft_email",
+                "description" to "Prepare an email to send on the user's behalf. Use whenever the user asks to 'send an email to X', 'email X about Y', 'write a mail to X'. Extract the recipient's name (or email address if spoken), a short subject, and the message body from what the user said. This does NOT send the email yet — it only prepares it and reads it back for confirmation. You MUST call confirm_send_email after the user says yes.",
+                "parameters" to mapOf(
+                    "type" to "object",
+                    "properties" to mapOf(
+                        "recipient" to mapOf("type" to "string", "description" to "The contact name or email address to send to"),
+                        "subject" to mapOf("type" to "string", "description" to "A short email subject line"),
+                        "body" to mapOf("type" to "string", "description" to "The email message body, written out in full sentences")
+                    ),
+                    "required" to listOf("recipient", "subject", "body")
+                )
+            ),
+            mapOf(
+                "type" to "function",
+                "name" to "confirm_send_email",
+                "description" to "Actually send the email that was most recently prepared with draft_email. Only call this after you have read the draft back to the user and they clearly confirmed with something like 'yes', 'send it', 'go ahead'. If the user says no or asks to change something, do NOT call this — call draft_email again instead with the correction.",
+                "parameters" to mapOf(
+                    "type" to "object",
+                    "properties" to mapOf<String, Any>()
+                )
+            ),
+            mapOf(
+                "type" to "function",
+                "name" to "enter_silent_mode",
+                "description" to "Go into silent mode and stop speaking out loud. Use when the user asks you to 'be quiet', 'go silent', 'stop talking', 'mute yourself', 'silent mode', 'chup ho jao', 'shaant ho jao', or similar. You keep listening so you can still be told to speak again, but you stop producing voice output until silent mode is turned off.",
+                "parameters" to mapOf(
+                    "type" to "object",
+                    "properties" to mapOf<String, Any>()
+                )
+            ),
+            mapOf(
+                "type" to "function",
+                "name" to "exit_silent_mode",
+                "description" to "Leave silent mode and start speaking out loud again. Use when the user asks you to 'start talking', 'speak again', 'you can talk now', 'unmute', 'exit silent mode', 'wapas bolo', or similar.",
+                "parameters" to mapOf(
+                    "type" to "object",
+                    "properties" to mapOf<String, Any>()
+                )
             )
         )
 
@@ -1208,6 +1300,12 @@ When the user asks to "take a pic and add to notes", "click photo and save in no
 MEETING MINUTES: When the user asks to "start meeting minutes", "record this meeting", "start recording the meeting", or similar, use the start_meeting tool to begin recording. If they mention a specific meeting name (e.g., "start meeting minutes for Raghav Meeting"), extract the meeting name and pass it in the 'title' parameter. Otherwise leave title empty for auto-generation.
 
 NOTIFICATIONS: You CAN read the user's phone notifications. When the user asks "what notifications do I have", "any new messages/notifications", "read my notifications", or similar (in any language), call the read_notifications tool and tell them about their recent notifications in a brief, spoken-word style.
+
+SILENT MODE: When the user asks you to be quiet, go silent, stop talking, mute yourself, or similar (in any language, e.g. "chup ho jao", "shaant ho jao"), call the enter_silent_mode tool. Give a single very short spoken acknowledgement (like "Okay") and then stay quiet. When the user later asks you to speak again, talk, unmute, or exit silent mode (e.g. "wapas bolo"), call the exit_silent_mode tool and give a short spoken confirmation that you're back.
+
+EMAIL - READING: When the user asks about new emails, their inbox, or unread mail, call read_emails and tell them the result briefly.
+
+EMAIL - SENDING (always confirm first): When the user asks you to email or write to someone, call draft_email with your best guess at recipient, subject, and body from what they said. Then READ THE DRAFT BACK to the user out loud in your own next spoken turn (recipient, subject, and a short summary of the body) and ask "should I send it?". Do NOT call confirm_send_email in the same turn as draft_email. Only call confirm_send_email in a LATER turn, after the user has explicitly agreed (e.g. "yes", "send it", "go ahead"). If the user wants changes, call draft_email again with the corrected details and read it back again. If the user declines, do not send anything.
 """
 
         if (activeProvider == ModelProvider.GPT_REALTIME) {
@@ -2028,6 +2126,22 @@ NOTIFICATIONS: You CAN read the user's phone notifications. When the user asks "
                 scoHelper = null
             } catch (e: Exception) {
                 Log.w(TAG, "Error cleaning up SCO: ${e.message}")
+            }
+
+            // Hand the audio system back to normal so music/video and the glasses'
+            // A2DP route behave correctly after the conversation ends. Without this
+            // the device stays in communication/telephony mode.
+            try {
+                audioManager?.let { am ->
+                    if (am.isBluetoothScoOn) {
+                        am.isBluetoothScoOn = false
+                        am.stopBluetoothSco()
+                    }
+                    am.mode = AudioManager.MODE_NORMAL
+                }
+                Log.d(TAG, "🔄 Audio mode restored to NORMAL")
+            } catch (e: Exception) {
+                Log.w(TAG, "Error restoring audio mode: ${e.message}")
             }
 
             // Release audio effects

@@ -13,9 +13,6 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import org.jtransforms.fft.FloatFFT_1D
-import org.json.JSONObject
-import java.io.File
-import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -28,13 +25,18 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
- * Single-model "Hey IMI" detector using custom_wakeword/imi_cnn.onnx.
+ * Single-model "Hey IMI" detector using custom_wakeword/imi_cnn_mobile.onnx.
  *
- * Pipeline is aligned with the model guide:
+ * This is a 1:1 port of the iOS wake-word pipeline (WakeWordDetector.swift +
+ * MelSpectrogramExtractor.swift). The SAME model file and the SAME preprocessing
+ * and detection constants are used so Android behaves identically to iOS.
+ *
+ * Pipeline:
  * - 16 kHz mono input
  * - 1.5s rolling window (24,000 samples)
  * - 100ms step
- * - log-mel -> clip[-80,0] -> normalize to [-1,+1]
+ * - peak-normalize audio -> STFT (periodic 400-Hann in 512 FFT, hop 160)
+ * - Slaney mel (40 bands, 80..7600 Hz) -> power_to_db clip[-80,0] -> normalize [-1,+1]
  * - ONNX input shape: [1,1,40,150]
  */
 class HeyImiWakeWordDetector(
@@ -44,10 +46,9 @@ class HeyImiWakeWordDetector(
     companion object {
         private const val TAG = "HeyImiWakeWord"
 
-        private const val MODEL_FP32 = "custom_wakeword/imi_cnn.onnx"
-        private const val MODEL_FP32_DATA = "custom_wakeword/imi_cnn.onnx.data"
-        private const val MODEL_INT8 = "custom_wakeword/imi_wakeword_int8.onnx"
-        private const val MODEL_INFO = "custom_wakeword/cnn_model_info.json"
+        // Single embedded model, identical to the iOS app (imi_cnn_mobile.onnx).
+        // Weights are embedded (no external .data sidecar).
+        private const val MODEL_FP32 = "custom_wakeword/imi_cnn_mobile.onnx"
 
         const val SAMPLE_RATE = 16_000
         private const val N_MELS = 40
@@ -62,17 +63,15 @@ class HeyImiWakeWordDetector(
         const val BUFFER_SIZE = N_TIME * HOP_LEN // 24,000 samples = 1.5s
         const val CHUNK_SIZE = 1_600 // 100ms
 
-        // Detection defaults from integration guide.
-        const val DEFAULT_THRESHOLD = 0.42f
-        private const val DEFAULT_THRESHOLD_OFF_RATIO = 0.55f
-        private const val DEFAULT_SMOOTHING = 3
-        private const val DEFAULT_CONSEC = 2
-        private const val DEFAULT_COOLDOWN_MS = 1_500L
-        private const val DEFAULT_ENERGY_GATE = 0.005f
-        private const val DEFAULT_DELTA_TRIGGER = 0.0f
-        private const val DEFAULT_BASELINE_TAU_S = 10.0f
-        private const val DEFAULT_SPEECH_FLOOR = 0.02f
-        private const val SILENCE_GAP_CHUNKS = 5
+        // Detection constants — EXACTLY matching iOS WakeWordDetector.swift
+        // (phone/headset-mic settings). Do not diverge from these without also
+        // changing iOS, or the two apps will behave differently.
+        const val DEFAULT_THRESHOLD = 0.55f        // sustained EMA fire level
+        private const val DEFAULT_PEAK_TRIGGER = 0.85f // single raw frame -> fire now
+        private const val DEFAULT_SMOOTHING = 2     // 2/(2+1) => emaAlpha 0.667
+        private const val DEFAULT_CONSEC = 2        // frames above threshold to fire
+        private const val DEFAULT_COOLDOWN_MS = 2_000L
+        private const val DEFAULT_ENERGY_GATE = 0.005f // RMS below this = silence, skip model
         private const val EXTERNAL_AUDIO_PRIORITY_MS = 1500L
     }
 
@@ -86,7 +85,6 @@ class HeyImiWakeWordDetector(
     private var isListening = false
     private var activeAudioSource: Int = MediaRecorder.AudioSource.MIC
     private var lastMonitorLogTs = 0L
-    private var framesSinceSpeech = SILENCE_GAP_CHUNKS
     @Volatile
     private var lastExternalAudioTs = 0L
     private var lastExternalPriorityLogTs = 0L
@@ -98,19 +96,16 @@ class HeyImiWakeWordDetector(
     private val bufferLock = Any()
 
     private var threshold = DEFAULT_THRESHOLD
-    private var thresholdOff = DEFAULT_THRESHOLD * DEFAULT_THRESHOLD_OFF_RATIO
+    private var peakTrigger = DEFAULT_PEAK_TRIGGER
     private val smoothing = DEFAULT_SMOOTHING
     private val consec = DEFAULT_CONSEC
     private val cooldownMs = DEFAULT_COOLDOWN_MS
     private val energyGate = DEFAULT_ENERGY_GATE
-    private val deltaTrigger = DEFAULT_DELTA_TRIGGER
-    private val speechFloor = DEFAULT_SPEECH_FLOOR
 
+    // iOS emaAlpha = 0.667 (SMOOTHING=2 => 2/(2+1)).
     private val emaAlpha = 2.0f / (smoothing + 1.0f)
-    private val baselineAlpha = 1.0f / max(DEFAULT_BASELINE_TAU_S * 10.0f, 1.0f)
 
     private var ema = 0.0f
-    private var ambientBaseline = 0.0f
     private var streak = 0
     private var lastFireTs = 0L
 
@@ -128,20 +123,13 @@ class HeyImiWakeWordDetector(
                 setIntraOpNumThreads(2)
             }
 
-            val modelUsed = try {
-                val modelFile = prepareFp32ModelFiles()
-                session = ortEnv?.createSession(modelFile.absolutePath, options)
-                MODEL_FP32
-            } catch (fp32Error: Exception) {
-                Log.w(TAG, "FP32 model init failed (${fp32Error.message}); falling back to INT8 model")
-                val int8Model = loadModelFromAssets(MODEL_INT8)
-                session = ortEnv?.createSession(int8Model, options)
-                MODEL_INT8
-            }
+            // Load the same single-file model the iOS app ships (weights embedded).
+            val modelBytes = loadModelFromAssets(MODEL_FP32)
+            session = ortEnv?.createSession(modelBytes, options)
+            val modelUsed = MODEL_FP32
 
             inputName = session?.inputNames?.firstOrNull() ?: "mel_spectrogram"
             validateModelSignature()
-            applyThresholdFromMetadata()
 
             preloadChimeSound()
             Log.i(TAG, "Initialized wake-word model: $modelUsed input=$inputName")
@@ -152,9 +140,8 @@ class HeyImiWakeWordDetector(
     }
 
     fun setThreshold(value: Float) {
-        threshold = value.coerceIn(0.005f, 0.5f)
-        thresholdOff = threshold * DEFAULT_THRESHOLD_OFF_RATIO
-        Log.d(TAG, "Threshold set: threshold=$threshold thresholdOff=$thresholdOff")
+        threshold = value.coerceIn(0.005f, 0.99f)
+        Log.d(TAG, "Threshold set: threshold=$threshold")
     }
 
     fun getThreshold(): Float = threshold
@@ -191,7 +178,7 @@ class HeyImiWakeWordDetector(
             listeningThread = Thread({ processAudioLoop() }, "HeyImiWakeWord-Loop").also { it.start() }
             Log.i(
                 TAG,
-                "Wake config: threshold=$threshold thresholdOff=$thresholdOff smoothing=$smoothing consec=$consec cooldownMs=$cooldownMs energyGate=$energyGate speechFloor=$speechFloor deltaTrigger=$deltaTrigger"
+                "Wake config: threshold=$threshold peakTrigger=$peakTrigger smoothing=$smoothing consec=$consec cooldownMs=$cooldownMs energyGate=$energyGate emaAlpha=$emaAlpha"
             )
             Log.i(TAG, "Wake-word listening started (source=${audioSourceName(activeAudioSource)})")
         } catch (e: SecurityException) {
@@ -261,7 +248,7 @@ class HeyImiWakeWordDetector(
                 System.arraycopy(samples, samples.size - copySize, rollingBuffer, BUFFER_SIZE - copySize, copySize)
             }
 
-            evaluateCurrentWindow(samples)
+            evaluateCurrentWindow()
         } catch (e: Exception) {
             Log.e(TAG, "processExternalAudio failed: ${e.message}")
         }
@@ -301,36 +288,16 @@ class HeyImiWakeWordDetector(
                     continue
                 }
 
-                val chunkRms = computeRms(chunk, read)
-                val isSpeech = chunkRms >= speechFloor
-                if (isSpeech) {
-                    framesSinceSpeech = 0
-                } else {
-                    framesSinceSpeech = kotlin.math.min(framesSinceSpeech + 1, SILENCE_GAP_CHUNKS + 1)
-                }
-
+                // Append the new chunk to the tail of the rolling window, exactly
+                // like the iOS RingBuffer (no speech-floor gating / silence-wipe;
+                // the energy gate on the full window handles silence — see iOS
+                // WakeWordDetector.checkForWakeWord).
                 synchronized(bufferLock) {
                     System.arraycopy(rollingBuffer, read, rollingBuffer, 0, BUFFER_SIZE - read)
-
-                    when {
-                        isSpeech -> {
-                            System.arraycopy(chunk, 0, rollingBuffer, BUFFER_SIZE - read, read)
-                        }
-                        framesSinceSpeech == SILENCE_GAP_CHUNKS -> {
-                            // After sustained silence, wipe full window to mirror terminal runtime behavior.
-                            rollingBuffer.fill(0)
-                        }
-                        framesSinceSpeech > SILENCE_GAP_CHUNKS -> {
-                            rollingBuffer.fill(0.toShort(), BUFFER_SIZE - read, BUFFER_SIZE)
-                        }
-                        else -> {
-                            // Keep short inter-word gaps as real audio to avoid over-resetting buffer state.
-                            System.arraycopy(chunk, 0, rollingBuffer, BUFFER_SIZE - read, read)
-                        }
-                    }
+                    System.arraycopy(chunk, 0, rollingBuffer, BUFFER_SIZE - read, read)
                 }
 
-                evaluateCurrentWindow(chunk, read, chunkRms)
+                evaluateCurrentWindow()
             } catch (_: InterruptedException) {
                 break
             } catch (e: Exception) {
@@ -339,61 +306,79 @@ class HeyImiWakeWordDetector(
         }
     }
 
-    private fun evaluateCurrentWindow(chunk: ShortArray, readSize: Int = chunk.size, rms: Float = computeRms(chunk, readSize)) {
+    /**
+     * 1:1 port of iOS WakeWordDetector.checkForWakeWord + processScore + fireDetection.
+     * Order: energy gate (on full window) -> infer -> EMA smooth -> peak trigger
+     * (raw >= 0.85) -> threshold + consec gate (ema >= 0.55, 2 frames) -> cooldown.
+     */
+    private fun evaluateCurrentWindow() {
         val now = System.currentTimeMillis()
 
+        val windowCopy = synchronized(bufferLock) { rollingBuffer.copyOf() }
+
+        // Energy gate (iOS step 1): RMS of the FULL 1.5s window. On silence, skip
+        // the model and decay the EMA toward zero so a stale streak can't survive.
+        val rms = computeRms(windowCopy, windowCopy.size)
         if (rms < energyGate) {
             ema *= (1.0f - emaAlpha)
+            streak = 0
             if (now - lastMonitorLogTs >= 3000L) {
                 Log.d(
                     TAG,
-                    "Wake monitor: rms=${"%.5f".format(rms)} raw=0.000 smooth=${"%.5f".format(ema)} threshold=${"%.3f".format(threshold)} source=${audioSourceName(activeAudioSource)} speechFloor=${"%.3f".format(speechFloor)}"
+                    "Wake monitor (gated): rms=${"%.5f".format(rms)} raw=0.000 ema=${"%.5f".format(ema)} threshold=${"%.3f".format(threshold)} source=${audioSourceName(activeAudioSource)}"
                 )
                 lastMonitorLogTs = now
             }
             return
         }
 
-        val windowCopy = synchronized(bufferLock) { rollingBuffer.copyOf() }
         val rawScore = infer(windowCopy)
 
+        // EMA smooth (iOS step 2).
         ema = emaAlpha * rawScore + (1.0f - emaAlpha) * ema
-        val smooth = ema
-
-        ambientBaseline = (1.0f - baselineAlpha) * ambientBaseline + baselineAlpha * smooth
-        val delta = smooth - ambientBaseline
 
         if (now - lastMonitorLogTs >= 3000L) {
             Log.d(
                 TAG,
-                "Wake monitor: rms=${"%.5f".format(rms)} raw=${"%.5f".format(rawScore)} smooth=${"%.5f".format(smooth)} base=${"%.5f".format(ambientBaseline)} delta=${"%.5f".format(delta)} streak=$streak threshold=${"%.3f".format(threshold)} source=${audioSourceName(activeAudioSource)}"
+                "Wake monitor: rms=${"%.5f".format(rms)} raw=${"%.5f".format(rawScore)} ema=${"%.5f".format(ema)} streak=$streak threshold=${"%.3f".format(threshold)} peak=${"%.3f".format(peakTrigger)} source=${audioSourceName(activeAudioSource)}"
             )
             lastMonitorLogTs = now
         }
 
-        if ((now - lastFireTs) < cooldownMs) {
-            streak = 0
+        // Peak trigger (iOS step 5): a single confident raw frame fires immediately.
+        if (rawScore >= peakTrigger) {
+            Log.i(TAG, "Peak trigger! raw=$rawScore")
+            fireDetection(rawScore)
             return
         }
 
-        val deltaHit = deltaTrigger > 0.0f && delta >= deltaTrigger && smooth > thresholdOff
-        val isHit = smooth >= threshold || deltaHit
-
-        if (isHit) {
+        // Threshold + consec gate (iOS steps 3-4).
+        if (ema >= threshold) {
             streak += 1
-        } else if (smooth < thresholdOff) {
+            if (streak >= consec) {
+                Log.i(TAG, "EMA trigger! ema=$ema hits=$streak")
+                fireDetection(ema)
+            }
+        } else {
             streak = 0
         }
+    }
 
-        if (streak >= consec) {
-            streak = 0
-            lastFireTs = now
-            Log.i(TAG, "Hey IMI detected: raw=$rawScore smooth=$smooth delta=$delta")
-            isListening = false
-            mainHandler.post {
-                playChimeSound()
-                onWakeWordDetected(smooth)
-            }
+    /** iOS fireDetection: cooldown debounce, reset EMA/streak, notify. */
+    private fun fireDetection(confidence: Float) {
+        val now = System.currentTimeMillis()
+        if ((now - lastFireTs) < cooldownMs) {
+            return
+        }
+
+        lastFireTs = now
+        ema = 0.0f
+        streak = 0
+        Log.i(TAG, "Hey IMI detected: confidence=$confidence")
+        isListening = false
+        mainHandler.post {
+            playChimeSound()
+            onWakeWordDetected(confidence)
         }
     }
 
@@ -429,6 +414,20 @@ class HeyImiWakeWordDetector(
             FloatArray(BUFFER_SIZE).also { dst ->
                 System.arraycopy(audio, 0, dst, 0, audio.size)
             }
+        }
+
+        // Peak-normalize the audio (REQUIRED by the model contract, matching iOS
+        // MelSpectrogramExtractor step 2: audio /= max(abs(audio)), skip if peak
+        // < 1e-6). The model was trained on peak-normalized clips; without this,
+        // scores collapse toward ~0. THIS WAS MISSING ON ANDROID.
+        var peak = 0.0f
+        for (v in clipped) {
+            val a = abs(v)
+            if (a > peak) peak = a
+        }
+        if (peak > 1e-6f) {
+            val inv = 1.0f / peak
+            for (i in clipped.indices) clipped[i] *= inv
         }
 
         val spec = computePowerSpectrogram(clipped) // [nFrames][nFftBins]
@@ -495,8 +494,13 @@ class HeyImiWakeWordDetector(
     private fun buildHannWindow(): FloatArray {
         val window = FloatArray(N_FFT)
         val offset = (N_FFT - WIN_LEN) / 2
+        // PERIODIC Hann (librosa fftbins=True / torch periodic=True), matching iOS
+        // MelSpectrogramExtractor.buildHannWindow: denominator is WIN_LEN, NOT
+        // WIN_LEN-1. The model was trained with the periodic window; the symmetric
+        // form shifts every coefficient and shows up as a ~0.006 mel error.
+        val denom = WIN_LEN.toFloat()
         for (i in 0 until WIN_LEN) {
-            val v = 0.5f - 0.5f * cos((2.0 * PI * i / (WIN_LEN - 1)).toFloat())
+            val v = 0.5f - 0.5f * cos((2.0 * PI * i / denom).toFloat())
             window[offset + i] = v
         }
         return window
@@ -619,10 +623,8 @@ class HeyImiWakeWordDetector(
 
     private fun resetState() {
         ema = 0.0f
-        ambientBaseline = 0.0f
         streak = 0
         lastFireTs = 0L
-        framesSinceSpeech = SILENCE_GAP_CHUNKS
         lastExternalAudioTs = 0L
         lastExternalPriorityLogTs = 0L
     }
@@ -738,46 +740,5 @@ class HeyImiWakeWordDetector(
         }
 
         Log.i(TAG, "Wake model signature validated: input=$inputName shape=${shape.joinToString(prefix = "[", postfix = "]")}$dynamicSuffix")
-    }
-
-    private fun applyThresholdFromMetadata() {
-        try {
-            val rawJson = context.assets.open(MODEL_INFO).bufferedReader().use { it.readText() }
-            val meta = JSONObject(rawJson)
-            if (!meta.has("threshold")) return
-
-            val value = meta.getDouble("threshold").toFloat().coerceIn(0.005f, 0.5f)
-            threshold = value
-            thresholdOff = threshold * DEFAULT_THRESHOLD_OFF_RATIO
-            Log.i(TAG, "Applied threshold from metadata: threshold=$threshold thresholdOff=$thresholdOff")
-        } catch (e: Exception) {
-            Log.d(TAG, "Threshold metadata not applied (${e.message}); using default threshold=$threshold")
-        }
-    }
-
-    private fun prepareFp32ModelFiles(): File {
-        val modelFile = copyAssetToModelCache(MODEL_FP32)
-        copyAssetToModelCache(MODEL_FP32_DATA)
-        return modelFile
-    }
-
-    private fun copyAssetToModelCache(assetPath: String): File {
-        val modelsDir = File(context.filesDir, "wakeword_models")
-        if (!modelsDir.exists()) {
-            modelsDir.mkdirs()
-        }
-
-        val fileName = assetPath.substringAfterLast('/')
-        val outFile = File(modelsDir, fileName)
-
-        // Always refresh cached model file from assets so git-pulled model updates
-        // are picked up without requiring the user to clear app data.
-        context.assets.open(assetPath).use { input ->
-            FileOutputStream(outFile, false).use { output ->
-                input.copyTo(output)
-                output.fd.sync()
-            }
-        }
-        return outFile
     }
 }

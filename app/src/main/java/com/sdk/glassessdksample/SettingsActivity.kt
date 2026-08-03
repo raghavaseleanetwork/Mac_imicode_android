@@ -10,7 +10,10 @@ import android.widget.ProgressBar
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.common.api.ApiException
 import com.sdk.glassessdksample.databinding.ActivitySettingsBinding
 import com.sdk.glassessdksample.ui.AiResponsePrefs
 import com.sdk.glassessdksample.ui.Mark1BottomNavManager
@@ -24,15 +27,48 @@ import com.sdk.glassessdksample.wakeword.WakeWordEngineSettings
 class SettingsActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivitySettingsBinding
+    private lateinit var gmailService: GmailService
+
+    private val gmailSignInLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        try {
+            GoogleSignIn.getSignedInAccountFromIntent(result.data).getResult(ApiException::class.java)
+            Toast.makeText(this, "Gmail connected", Toast.LENGTH_SHORT).show()
+        } catch (e: ApiException) {
+            Toast.makeText(this, "Gmail connection failed: ${e.statusCode}", Toast.LENGTH_LONG).show()
+        }
+        refreshGmailStatus()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivitySettingsBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        gmailService = GmailService(this)
         setupSettings()
         setupAiPreferences()
+        setupGmailConnect()
         Mark1BottomNavManager.setup(this, binding.bottomNavigation, R.id.nav_profile)
+    }
+
+    private fun setupGmailConnect() {
+        refreshGmailStatus()
+        binding.btnConnectGmail.setOnClickListener {
+            gmailSignInLauncher.launch(gmailService.signInClient().signInIntent)
+        }
+    }
+
+    private fun refreshGmailStatus() {
+        if (gmailService.isGmailReady()) {
+            val email = GoogleSignIn.getLastSignedInAccount(this)?.email ?: ""
+            binding.tvGmailStatus.text = "Connected as $email"
+            binding.btnConnectGmail.text = "Reconnect Gmail"
+        } else {
+            binding.tvGmailStatus.text = "Not connected"
+            binding.btnConnectGmail.text = "Connect Gmail"
+        }
     }
 
     /**
@@ -109,6 +145,7 @@ class SettingsActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (::gmailService.isInitialized) refreshGmailStatus()
         refreshUsageUi()
         updateWakeEngineUi(WakeWordEngineSettings.getSelectedEngine(this))
     }
