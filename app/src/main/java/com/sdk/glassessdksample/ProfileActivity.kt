@@ -76,19 +76,10 @@ class ProfileActivity : AppCompatActivity() {
             )
         }
 
-        // Force Mark 1 while Mark II is disabled, even if a previous install had
-        // saved MARK2 as the preference.
-        updateSelection(DeviceType.MARK1)
+        updateSelection(current)
 
         cardMark1.setOnClickListener { updateSelection(DeviceType.MARK1) }
-
-        // ── Mark II temporarily disabled ──────────────────────────────────────
-        // Card stays visible but can't be selected; only Mark 1 is supported in
-        // this build. To re-enable, restore the selection listener below.
-        cardMark2.alpha = 0.45f
-        cardMark2.setOnClickListener {
-            Toast.makeText(this, "Mark II isn't available yet — please select Mark I.", Toast.LENGTH_SHORT).show()
-        }
+        cardMark2.setOnClickListener { updateSelection(DeviceType.MARK2) }
 
         view.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnSwitchConfirm).setOnClickListener {
             sheet.dismiss()

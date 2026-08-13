@@ -15,6 +15,7 @@ import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import com.sdk.glassessdksample.ListeningService
 import com.sdk.glassessdksample.MainActivity
@@ -45,7 +46,49 @@ import org.greenrobot.eventbus.EventBus
 class HotHelper private constructor(private val context: Context) {
     companion object {
         private const val TAG = "HotHelper"
-        
+
+        /**
+         * Single-frame instant-fire level for Mark 2 only (stock default is 0.85).
+         *
+         * Measured on Mark 2 hardware the two populations OVERLAP:
+         *     false: 0.9344, 0.9521, 0.9642, 0.9667
+         *     true:  0.9405, 0.9595
+         * so no cut-off removes every false trigger while keeping every real one.
+         * Tried in order: 0.85 (stock, everything fires), 0.98 (killed BOTH real
+         * detections), 0.93 (blocked only 0.9344). At 0.955 the two lowest false
+         * positives are rejected and the 0.9405 real detection is rejected with
+         * them — i.e. this trades a missed wake word for fewer false ones, and
+         * 0.9642/0.9667 still get through. This is the practical ceiling: above
+         * ~0.96 both known real detections are lost.
+         *
+         * The real fix is the mic route, not this number. The detector is running
+         * on the glasses SCO mic while HotHelper logs "phone mic mode (SCO
+         * bypassed)" — iOS runs its wake detector on the PHONE mic, and Mark 1
+         * has no HFP route to be captured by, which is why both of those work.
+         */
+        private const val MARK2_PEAK_TRIGGER = 0.955f
+
+        /**
+         * Sustained-EMA fire level for Mark 2 only (stock default is 0.55).
+         *
+         * Without this, [MARK2_PEAK_TRIGGER] does almost nothing. The two gates in
+         * HeyImiWakeWordDetector.evaluateCurrentWindow are independent: a raw frame
+         * of 0.9344 is rejected by the 0.955 peak gate, but with emaAlpha 0.667 its
+         * EMA reaches ~0.93 after two frames — miles above 0.55 — so DEFAULT_CONSEC
+         * (2) frames of the same ordinary conversation fire it anyway through the
+         * threshold path. Every false trigger the raised peak gate was meant to stop
+         * simply arrives one frame later.
+         *
+         * 0.95 sits just under the peak trigger, so the sustained path can no longer
+         * undo the peak decision: scores that the peak gate rejects (0.9344) are
+         * rejected here too, and scores that pass it (0.9642, 0.9667) had already
+         * fired. It inherits the same known limits as [MARK2_PEAK_TRIGGER] — the
+         * populations overlap, so this reduces false triggers rather than
+         * eliminating them, and the 0.9405 real detection stays lost.
+         */
+        private const val MARK2_THRESHOLD = 0.95f
+
+
         @Volatile
         private var instance: HotHelper? = null
 
@@ -87,6 +130,26 @@ class HotHelper private constructor(private val context: Context) {
     // Mute state - when true, wake word detection is disabled
     private var isMuted = false
 
+    /**
+     * 🆕 Temporary suppression, independent of the user-facing mute state.
+     *
+     * Engaged for the duration of a vision capture → download → analysis →
+     * spoken answer. The detector shares the glasses' SCO mic, so a wake word
+     * landing mid-analysis starts a fresh Gemini Live session and tears down the
+     * one that is about to speak the vision answer.
+     *
+     * This is deliberately a SEPARATE flag from [isMuted] so engaging/releasing
+     * it can never clobber the user's own mute choice.
+     *
+     * Checked in both [start] and [startDetectorInternal] — the latter matters
+     * because a start() issued before suppression can still land its async SCO
+     * continuation ~1.5s later, after suppression was engaged.
+     *
+     * @Volatile: set from MainActivity/VisionChat callbacks on different threads.
+     */
+    @Volatile
+    private var isSuppressed = false
+
     init {
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     }
@@ -104,6 +167,23 @@ class HotHelper private constructor(private val context: Context) {
     }
 
     /**
+     * 🆕 Engage/release temporary suppression (see [isSuppressed]).
+     * Engaging stops any in-flight or pending detector immediately.
+     * Releasing does NOT auto-restart - the caller decides when to restart, so
+     * this can't re-arm the detector while the user is muted or mid-conversation.
+     */
+    fun setSuppressed(suppressed: Boolean) {
+        isSuppressed = suppressed
+        if (suppressed && (isStarted || isStartPending)) {
+            Log.d(TAG, "👁️ Suppression enabled - stopping wake word detection")
+            stop()
+        }
+        Log.d(TAG, "👁️ Wake word suppression: ${if (suppressed) "ENGAGED" else "RELEASED"}")
+    }
+
+    fun isSuppressed(): Boolean = isSuppressed
+
+    /**
      * Allow external callers to prefer glass BLE audio for wake detection.
      * When enabled, processGlassAudio() will be used instead of phone mic.
      */
@@ -115,12 +195,17 @@ class HotHelper private constructor(private val context: Context) {
      * Set detection threshold (0.0 to 1.0)
      * Lower = more sensitive but more false positives
      * Higher = less sensitive but fewer false positives
+     *
+     * On Mark 2 this is a request, not a command: [applyDeviceSpecificTuning] runs
+     * last and keeps the device threshold. Callers pass the stock iOS value
+     * unconditionally, which would otherwise drop Mark 2 back to Mark 1's gate.
      */
     fun setThreshold(value: Float) {
         configuredThreshold = value
         heyImiDetector?.setThreshold(value)
         snowboyDetector?.setThreshold(value)
-        Log.d(TAG, "Detection threshold set to: $value (engine=${activeEngine.displayName})")
+        applyDeviceSpecificTuning()
+        Log.d(TAG, "Detection threshold requested: $value (engine=${activeEngine.displayName}, effective=${activeDetectorThreshold()})")
     }
 
     /**
@@ -157,6 +242,14 @@ class HotHelper private constructor(private val context: Context) {
             return
         }
 
+        // 🆕 Vision analysis in flight - see isSuppressed. Blocks every restart
+        // path (ListeningService rearm, onResume, engine sync, Mark1, ...) since
+        // they all terminate here.
+        if (isSuppressed) {
+            Log.d(TAG, "👁️ Wake word detection suppressed (vision in progress) - not starting")
+            return
+        }
+
         syncEngineFromSettings()
 
         if (isStartPending) {
@@ -185,7 +278,13 @@ class HotHelper private constructor(private val context: Context) {
                 Log.e(TAG, "Wake detector initialization failed for engine=${activeEngine.displayName}")
                 return
             }
-            
+
+            // Re-apply on EVERY start, not just on first init: the detector is
+            // created once per process but the selected device can change after
+            // that, and a stale Mark 1 / Mark 2 tuning is what made both models
+            // listen with the same gates.
+            applyDeviceSpecificTuning()
+
             if (useGlassBLEAudio) {
                 Log.i(TAG, "Glass BLE audio preferred: external PCM can be fed via processGlassAudio()")
             }
@@ -250,17 +349,70 @@ class HotHelper private constructor(private val context: Context) {
             }
             
             heyImiDetector?.initialize()
-            configuredThreshold?.let { heyImiDetector?.setThreshold(it) }
-            
+            // Sets BOTH gates, and honours configuredThreshold on Mark 1.
+            applyDeviceSpecificTuning()
+
             Log.i(TAG, "✅ ONNX Detector initialized successfully")
             Log.i(TAG, "   📦 Model: custom_wakeword/imi_cnn_mobile.onnx")
             Log.i(TAG, "   🎯 Threshold: ${heyImiDetector?.getThreshold()}")
+            Log.i(TAG, "   🎯 Peak trigger: ${heyImiDetector?.getPeakTrigger()}")
             return true
         } catch (e: Exception) {
             Log.e(TAG, "❌ Failed to initialize ONNX detector: ${e.message}", e)
             Log.e(TAG, "   Check assets/custom_wakeword/imi_cnn_mobile.onnx exists and onnxruntime dependency is present")
             heyImiDetector = null
             return false
+        }
+    }
+
+    /**
+     * Applies the wake-word tuning for the CURRENTLY selected device. BOTH gates
+     * are set, because raising only one leaves the other free to fire on exactly
+     * the scores the raised one rejected — see [MARK2_THRESHOLD].
+     *
+     * - Mark 2: threshold [MARK2_THRESHOLD] + peak [MARK2_PEAK_TRIGGER].
+     * - Mark 1 (and "no device chosen yet"): the iOS-parity stock values, because
+     *   its quieter mic does not produce these scores.
+     *
+     * Both branches write explicitly — this must be able to UNDO a previous
+     * device's tuning. HotHelper is a process-lifetime singleton and the detector
+     * it owns outlives any single Activity, so a user who switches Mark 2 → Mark 1
+     * in ProfileActivity/DeviceSelectionActivity would otherwise keep the Mark 2
+     * gates (near-deaf) until the process is killed. Called from [start] rather
+     * than from detector construction alone for the same reason: construction
+     * happens once, device selection can change at any time after it.
+     *
+     * On Mark 2 this deliberately overrides [configuredThreshold]: device tuning
+     * is authoritative for the ONNX detector, and callers such as
+     * Mark1MainActivity set the stock 0.55 unconditionally.
+     *
+     * This remains a PARTIAL mitigation by construction — see [MARK2_PEAK_TRIGGER]
+     * for the measurements. The two score populations overlap, so this trades some
+     * false triggers away without eliminating them, and the gates cannot be pushed
+     * higher without losing real detections. A complete fix needs discrimination
+     * from somewhere other than these numbers (input route parity with iOS,
+     * two-stage phrase confirmation, or a retrained model).
+     */
+    private fun applyDeviceSpecificTuning() {
+        val detector = heyImiDetector ?: return
+
+        if (DevicePreferenceManager.getDeviceType(context) == DeviceType.MARK2) {
+            detector.setThreshold(MARK2_THRESHOLD)
+            detector.setPeakTrigger(MARK2_PEAK_TRIGGER)
+            Log.i(
+                TAG,
+                "🎚️ Mark 2 — threshold ${HeyImiWakeWordDetector.DEFAULT_THRESHOLD} → $MARK2_THRESHOLD, " +
+                    "peak trigger ${HeyImiWakeWordDetector.DEFAULT_PEAK_TRIGGER} → $MARK2_PEAK_TRIGGER (mic is more sensitive)"
+            )
+        } else {
+            val threshold = configuredThreshold ?: HeyImiWakeWordDetector.DEFAULT_THRESHOLD
+            detector.setThreshold(threshold)
+            detector.setPeakTrigger(HeyImiWakeWordDetector.DEFAULT_PEAK_TRIGGER)
+            Log.i(
+                TAG,
+                "🎚️ Mark 1 / unset — iOS-parity gates: threshold=$threshold " +
+                    "peak trigger=${HeyImiWakeWordDetector.DEFAULT_PEAK_TRIGGER}"
+            )
         }
     }
 
@@ -331,6 +483,31 @@ class HotHelper private constructor(private val context: Context) {
             Log.d(TAG, "SCO already active — starting ${activeEngine.displayName} detector immediately")
             startDetectorInternal(requestId)
             return
+        }
+
+        // Modern path (Android 12+): ask the framework to route communication
+        // capture to the headset. getProfileConnectionState(HEADSET) below often
+        // reports DISCONNECTED on these glasses even though the system CAN route
+        // to them, because the app's HFP connect went through a hidden API that
+        // Android blocklists — so checking that first would send every wake-word
+        // session to the phone mic. Try the supported API before giving up.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am != null) {
+            try {
+                // setCommunicationDevice() only takes effect in communication mode;
+                // in MODE_NORMAL the request is ignored and capture stays on the phone.
+                if (am.mode != AudioManager.MODE_IN_COMMUNICATION) {
+                    am.mode = AudioManager.MODE_IN_COMMUNICATION
+                }
+                val bt = am.availableCommunicationDevices
+                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                if (bt != null && am.setCommunicationDevice(bt)) {
+                    Log.d(TAG, "🎧 Wake detection routed to glasses via setCommunicationDevice(${bt.productName})")
+                    startDetectorInternal(requestId)
+                    return
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "setCommunicationDevice for wake detection failed: ${e.message}")
+            }
         }
 
         // If no Bluetooth/HFP available, just start detector
@@ -407,6 +584,16 @@ class HotHelper private constructor(private val context: Context) {
             startPendingSinceMs = 0L
             unregisterScoReceiverForStart()
             Log.d(TAG, "🔇 Canceled pending wake start because mute is enabled")
+            return
+        }
+
+        // 🆕 Suppression may have been engaged AFTER this start was requested but
+        // before its SCO wait completed - drop it rather than arming mid-vision.
+        if (isSuppressed) {
+            isStartPending = false
+            startPendingSinceMs = 0L
+            unregisterScoReceiverForStart()
+            Log.d(TAG, "👁️ Canceled pending wake start because vision is in progress")
             return
         }
 

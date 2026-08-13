@@ -8,7 +8,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Configure automatic photo upload to server"
+        android:text="Automatically upload photos captured by your glasses to your IMI Glass account."
         android:textSize="14sp"
         android:layout_marginBottom="16dp" />
 
@@ -23,27 +23,25 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Upload Server URL:"
+        android:text="Uploads to:"
         android:textSize="14sp"
         android:textStyle="bold"
-        android:layout_marginBottom="8dp" />
-
-    <EditText
-        android:id="@+id/uploadUrlInput"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:hint="http://your-server.com:8080/upload"
-        android:inputType="textUri"
-        android:textSize="14sp"
-        android:padding="12dp"
-        android:background="@android:drawable/edit_text" />
+        android:layout_marginBottom="4dp" />
 
     <TextView
+        android:id="@+id/uploadDestinationLabel"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Note: Use 10.0.2.2 for Android emulator localhost"
+        android:textSize="13sp"
+        android:textColor="#666666"
+        android:layout_marginBottom="8dp" />
+
+    <TextView
+        android:id="@+id/uploadAccountLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
         android:textSize="12sp"
         android:textColor="#666666"
-        android:layout_marginTop="8dp" />
+        android:layout_marginTop="4dp" />
 
 </LinearLayout>

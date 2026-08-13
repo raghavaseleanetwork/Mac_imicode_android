@@ -79,6 +79,14 @@ class MyBluetoothReceiver : QCBluetoothCallbackCloneReceiver() {
         LargeDataHandler.getInstance().initEnable()
         BleOperateManager.getInstance().isReady = true
 
+        // A fresh link starts at the default MTU and connection interval, so any
+        // earlier tuning no longer applies. Clear the rate-limit and tune now, while
+        // services are up but before any screen asks for an image — that way the
+        // first capture of a session is already fast instead of paying for the
+        // negotiation itself.
+        BleSpeedTuner.resetThrottle()
+        BleSpeedTuner.tune(MyApplication.instance, "ServicesDiscovered")
+
         // Disable firmware wake word - app handles wake-word detection.
         setNativeWakeWord(false)
         requestMicPermissionIfNeeded()

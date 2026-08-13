@@ -34,7 +34,9 @@ object UsageLimitManager {
         val used: Int,
         val limit: Int,
         val remaining: Int,
-        val progressPercent: Int
+        val progressPercent: Int,
+        /** True for free/unlimited features; [limit] and [remaining] are meaningless then. */
+        val unlimited: Boolean = false
     )
 
     data class UsageSnapshot(
@@ -92,12 +94,34 @@ object UsageLimitManager {
         }
     }
 
+    /**
+     * Features that are free and unlimited, i.e. never blocked by a plan limit.
+     *
+     * Vision (SEEING) is ungated: it powers Vision Chat, which must keep working on
+     * every plan including FREE. Usage is still COUNTED for these modes so the
+     * profile/usage screens keep showing real numbers — only the block is removed.
+     *
+     * Gating vision here, at the single point every caller funnels through, rather
+     * than at the individual call sites means no gate can be missed: Vision Chat,
+     * ChatActivity's image analysis and GeminiAiClient all consult this.
+     */
+    private val UNLIMITED_MODES = setOf(TokenUsageTracker.Mode.SEEING)
+
+    /** True when [mode] is free/unlimited and must never hit a plan limit. */
+    fun isUnlimited(mode: TokenUsageTracker.Mode): Boolean = mode in UNLIMITED_MODES
+
     @Synchronized
     fun tryConsume(context: Context?, mode: TokenUsageTracker.Mode): Boolean {
         if (context == null) return true
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         val used = getUsedInternal(prefs, mode)
+        // Unlimited features still record usage, but are never refused.
+        if (isUnlimited(mode)) {
+            setUsedInternal(prefs, mode, used + 1)
+            return true
+        }
+
         val limit = getLimit(context, mode)
         if (used >= limit) return false
 
@@ -158,6 +182,9 @@ object UsageLimitManager {
     fun promptUpgradeIfPossible(context: Context?, mode: TokenUsageTracker.Mode? = null) {
         val activity = context as? Activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
+        // Belt-and-braces: an unlimited feature can never be out of quota, so it must
+        // never raise a paywall even if some caller still asks it to.
+        if (mode != null && isUnlimited(mode)) return
 
         activity.runOnUiThread {
             showUpgradeDialog(activity, mode = mode)
@@ -253,7 +280,13 @@ object UsageLimitManager {
 
         titleView.text = targetPlan.title
         priceView.text = targetPlan.priceLabel
-        limitsView.text = "Voice ${targetPlan.limits.voiceCalls} | Vision ${targetPlan.limits.seeingCalls} | Chat ${targetPlan.limits.chatCalls}"
+        // Vision is free on every plan now, so advertising a per-plan vision quota
+        // here would be selling something the user already has.
+        limitsView.text = if (isUnlimited(TokenUsageTracker.Mode.SEEING)) {
+            "Voice ${targetPlan.limits.voiceCalls} | Vision ∞ | Chat ${targetPlan.limits.chatCalls}"
+        } else {
+            "Voice ${targetPlan.limits.voiceCalls} | Vision ${targetPlan.limits.seeingCalls} | Chat ${targetPlan.limits.chatCalls}"
+        }
 
         val isCurrent = currentPlan == targetPlan
         val canUpgradeToPlan = when (currentPlan) {
@@ -303,6 +336,17 @@ object UsageLimitManager {
 
     private fun buildFeatureUsage(context: Context, mode: TokenUsageTracker.Mode): FeatureUsage {
         val used = getUsed(context, mode)
+        if (isUnlimited(mode)) {
+            // No ceiling to fill, so keep the bar empty rather than showing a
+            // permanently maxed-out meter the user can do nothing about.
+            return FeatureUsage(
+                used = used,
+                limit = Int.MAX_VALUE,
+                remaining = Int.MAX_VALUE,
+                progressPercent = 0,
+                unlimited = true
+            )
+        }
         val limit = getLimit(context, mode)
         val remaining = max(0, limit - used)
         val progress = if (limit <= 0) 0 else min(100, (used * 100) / limit)

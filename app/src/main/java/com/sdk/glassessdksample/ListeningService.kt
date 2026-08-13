@@ -1,5 +1,4 @@
 package com.sdk.glassessdksample
-
 import com.sdk.glassessdksample.ui.AiResponsePrefs
 import com.sdk.glassessdksample.ui.BluetoothEvent
 import com.sdk.glassessdksample.ui.DeviceType
@@ -10,6 +9,7 @@ import com.sdk.glassessdksample.ui.LocalToolHandlers
 import com.sdk.glassessdksample.ui.Mark1MainActivity
 import com.sdk.glassessdksample.ui.QuickNote
 import com.sdk.glassessdksample.ui.QuickNotesManager
+import com.sdk.glassessdksample.ui.SongIdentifier
 import com.sdk.glassessdksample.ui.UserMemoryManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -49,6 +49,26 @@ class ListeningService : Service() {
         private const val WAKE_NOTIF_ID = 1002
 
         /**
+         * Length of res/raw/wake_chime.wav: 414,032 data bytes at 44.1kHz stereo
+         * 16-bit (176,400 B/s) = 2,347 ms, rounded up. Every delay that must outlast
+         * the chime is derived from this, so swapping the file only needs one edit.
+         */
+        private const val CHIME_DURATION_MS = 2_350L
+
+        /**
+         * Settle time before wake-word detection is re-armed. MUST exceed
+         * [CHIME_DURATION_MS]: the detector plays its own copy of the chime on
+         * detection, so re-arming sooner lets a freshly-armed detector hear the
+         * tail of that chime and fire again — the self-trigger loop this delay
+         * exists to prevent. Was 1_500, which was correct only while the chime was
+         * a ~200ms ToneGenerator beep.
+         */
+        private const val REARM_DELAY_MS = CHIME_DURATION_MS + 650
+
+        /** How often the deferred arm re-checks whether vision has finished. */
+        private const val VISION_ARM_POLL_MS = 1_000L
+
+        /**
          * Whether wake-word listening *should* be active. Kept in the companion so it
          * survives the OS re-creating this START_STICKY service: on a sticky restart
          * we must not re-arm the detector while a conversation owns the mic.
@@ -75,6 +95,13 @@ class ListeningService : Service() {
     private var chimePlayer: MediaPlayer? = null
     private var bgGeminiService: GeminiLiveService? = null
 
+    // Single-reply mode (Continuous Chat OFF): set once the AI has answered a real
+    // user turn, so the session closes as soon as that reply finishes playing and
+    // we go back to waiting for "Hey IMI".
+    private var endSessionAfterPlayback = false
+    // Backstop for the above, in case onAudioPlaybackEnd() never fires.
+    private var endSessionFallback: Runnable? = null
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
@@ -86,6 +113,20 @@ class ListeningService : Service() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED) {
             Log.w(TAG, "⏹️ RECORD_AUDIO not granted — cannot run microphone FGS, stopping self")
+            // We were launched via startForegroundService(), so the OS requires a
+            // startForeground() call within ~5s even on this bail-out path —
+            // stopSelf() alone throws ForegroundServiceDidNotStartInTimeException
+            // and kills the process (see Mark1MainActivity.startWakeWordListening).
+            // Post the notification to satisfy that contract, then immediately stop.
+            // On Android 14+ this itself throws SecurityException because the
+            // declared type is "microphone" and RECORD_AUDIO is exactly what we are
+            // missing — but the attempt still clears the pending-FGS obligation, so
+            // we swallow it and stop cleanly instead of crashing.
+            try {
+                startForeground(NOTIF_ID, buildNotification())
+            } catch (e: Exception) {
+                Log.w(TAG, "startForeground rejected on permission bail-out: ${e.message}")
+            }
             stopSelf()
             return
         }
@@ -137,9 +178,43 @@ class ListeningService : Service() {
         }
 
         wakeWordEnabled = true
+
+        // 👁️ Vision owns the audio route right now. Arming the detector here
+        // starts a phone-mic recorder against the MODE_IN_COMMUNICATION session
+        // Gemini Live is holding, which re-routes Bluetooth and silences the
+        // spoken vision result. Defer instead of dropping — the caller genuinely
+        // does want listening on, just not this instant.
+        if (MainActivity.visionBusy) {
+            Log.i(TAG, "👁️ Vision analysis in progress — deferring wake-word arm")
+            scheduleArmAfterVision()
+            return START_STICKY
+        }
+
         try { HotHelper.getInstance(applicationContext).start() } catch (_: Exception) {}
 
         return START_STICKY
+    }
+
+    /**
+     * Poll until the vision window closes, then arm the detector. Terminates
+     * either way: MainActivity.visionBusy has its own hard timeout
+     * (VISION_BUSY_TIMEOUT_MS), so this can never spin forever.
+     */
+    private fun scheduleArmAfterVision() {
+        mainHandler.postDelayed(object : Runnable {
+            override fun run() {
+                if (!wakeWordEnabled || bgConversationActive) {
+                    Log.d(TAG, "Deferred wake-word arm abandoned (enabled=$wakeWordEnabled bgChat=$bgConversationActive)")
+                    return
+                }
+                if (MainActivity.visionBusy) {
+                    mainHandler.postDelayed(this, VISION_ARM_POLL_MS)
+                    return
+                }
+                try { HotHelper.getInstance(applicationContext).start() } catch (_: Exception) {}
+                Log.i(TAG, "🔁 Wake word armed now that the vision window has closed")
+            }
+        }, VISION_ARM_POLL_MS)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -166,6 +241,15 @@ class ListeningService : Service() {
         if (event.type == BluetoothEvent.EventType.VOICE_TEXT) {
             val text = event.data as? String ?: return
             if (text.trim().lowercase() == "wake up") {
+                // 🆕 Vision capture/analysis owns the mic and the Gemini session
+                // right now. Starting a conversation here (foreground activity or
+                // background) would tear down the session that is about to speak
+                // the vision answer. Drop the wake word entirely.
+                if (MainActivity.visionBusy) {
+                    Log.i(TAG, "👁️ Ignoring wake word: vision analysis in progress")
+                    return
+                }
+
                 val targetActivity = if (DevicePreferenceManager.getDeviceType(applicationContext) == DeviceType.MARK1) {
                     Mark1MainActivity::class.java
                 } else {
@@ -191,7 +275,11 @@ class ListeningService : Service() {
                     try {
                         startActivity(activityIntent)
                     } catch (e: Exception) {
-                        Log.w(TAG, "startActivity skipped: ${e.message}")
+                        // The Activity never came up, so nothing will take over the
+                        // mic — re-arm here or the wake word stays dead until the
+                        // service restarts ("the AI stopped answering").
+                        Log.w(TAG, "startActivity skipped: ${e.message} — re-arming wake word")
+                        rearmWakeWord("startActivity failed")
                     }
                 } else {
                     Log.i(TAG, "📵 App not in foreground — starting conversation in background (phone stays locked)")
@@ -209,17 +297,34 @@ class ListeningService : Service() {
      */
     private fun startBackgroundConversation() {
         if (bgConversationActive) {
-            Log.w(TAG, "Background conversation already active — ignoring")
+            // onBluetoothEvent already disarmed the detector, and the running
+            // conversation won't re-arm it on our behalf — re-arm here so a
+            // duplicate wake event can't leave the assistant permanently deaf.
+            Log.w(TAG, "Background conversation already active — ignoring, re-arming wake word")
+            rearmWakeWord("duplicate wake event")
             return
         }
         bgConversationActive = true
+
+        // 🔂 Honour the SAME "Continuous Chat" setting the in-app flow uses. With it
+        // OFF the session must answer ONCE and go back to the wake word, so we also
+        // skip the spoken greeting — otherwise "Hi, how can I help?" would burn the
+        // single reply before the user has asked anything. (This is exactly what
+        // MainActivity.proceedWithGeminiLive does; the background path used to
+        // hardcode greetOnStart = true and never end the session, which is why the
+        // screen-off assistant always behaved like continuous mode.)
+        val continuousChat = isContinuousChatEnabled()
+        Log.i(TAG, "🔂 Background conversation mode: ${if (continuousChat) "CONTINUOUS" else "SINGLE-REPLY"}")
 
         mainHandler.post {
             playWakeChime {
                 try {
                     val svc = GeminiLiveService(applicationContext, backgroundCallbacks)
                     bgGeminiService = svc
-                    svc.startLiveConversation(buildBackgroundSystemInstruction(), greetOnStart = true)
+                    svc.startLiveConversation(
+                        buildBackgroundSystemInstruction(),
+                        greetOnStart = continuousChat
+                    )
                     Log.i(TAG, "🎙️ Background conversation started (phone stays locked)")
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to start background conversation: ${e.message}", e)
@@ -229,30 +334,80 @@ class ListeningService : Service() {
         }
     }
 
+    /** Reads the same pref the Settings switch and MainActivity use. */
+    private fun isContinuousChatEnabled(): Boolean =
+        applicationContext
+            .getSharedPreferences("imi_prefs", Context.MODE_PRIVATE)
+            .getBoolean("continuous_chat", MainActivity.CONTINUOUS_CHAT_DEFAULT)
+
+    /**
+     * Arms the single-reply shutdown for the background session: it closes as soon
+     * as the current reply finishes playing, so we fall back to "Hey IMI".
+     *
+     * Mirrors MainActivity.endSessionAfterCurrentReply — onAudioPlaybackEnd() is the
+     * normal path and the posted task is the backstop for when that callback never
+     * arrives (text-only reply, dropped playback signal). Whichever runs first
+     * cancels the other.
+     */
+    private fun endBackgroundSessionAfterCurrentReply(reason: String) {
+        endSessionAfterPlayback = true
+        endSessionFallback?.let { mainHandler.removeCallbacks(it) }
+        val fallback = Runnable {
+            if (endSessionAfterPlayback) {
+                endSessionAfterPlayback = false
+                endSessionFallback = null
+                Log.d(TAG, "🔂 $reason — playback-end never arrived, force-stopping")
+                endBackgroundConversation()
+            }
+        }
+        endSessionFallback = fallback
+        mainHandler.postDelayed(fallback, 10_000)
+    }
+
     /** Ends the background conversation and re-arms wake-word listening. */
     private fun endBackgroundConversation() {
         if (!bgConversationActive) return
         bgConversationActive = false
+        // Drop any armed single-reply shutdown, or a stale fallback from this
+        // session would fire during the NEXT conversation and cut it short.
+        endSessionAfterPlayback = false
+        endSessionFallback?.let { mainHandler.removeCallbacks(it) }
+        endSessionFallback = null
         try { bgGeminiService?.stopLiveConversation() } catch (_: Exception) {}
         bgGeminiService = null
 
-        // Re-arm after a settle delay so the tail of the AI's audio can't
-        // immediately re-trigger the wake word.
+        rearmWakeWord("background conversation ended")
+    }
+
+    /**
+     * Re-arms wake-word detection after a settle delay, so the tail of the AI's
+     * audio (or the chime) can't immediately re-trigger "Hey IMI".
+     *
+     * Every path that disarms the detector MUST end at this method. onBluetoothEvent
+     * sets wakeWordEnabled = false as soon as the wake word fires, so any path that
+     * then fails to hand the mic to a conversation would otherwise leave the
+     * assistant permanently deaf — which is what made the AI "sometimes stop
+     * answering" until the app was reopened.
+     */
+    private fun rearmWakeWord(reason: String) {
         mainHandler.postDelayed({
             if (!bgConversationActive) {
                 wakeWordEnabled = true
                 try { HotHelper.getInstance(applicationContext).start() } catch (_: Exception) {}
-                Log.i(TAG, "🔁 Wake word re-armed after background conversation")
+                Log.i(TAG, "🔁 Wake word re-armed ($reason)")
             }
-        }, 1_500)
+        }, REARM_DELAY_MS)
     }
 
     /** Plays the wake chime through the current audio route, then invokes [then]. */
     private fun playWakeChime(then: () -> Unit) {
         val fired = java.util.concurrent.atomic.AtomicBoolean(false)
         val once = { if (fired.compareAndSet(false, true)) then() }
-        // Backstop so a failed chime can never swallow the conversation start.
-        mainHandler.postDelayed({ once() }, 1_200)
+        // Backstop so a failed chime can never swallow the conversation start. Must
+        // stay LONGER than the chime itself, or it fires every time and the session
+        // starts while the chime is still sounding — feeding the chime straight into
+        // the live mic. It was 1_200 against a ~1s chime; wake_chime.wav is 2_350.
+        mainHandler.postDelayed({ once() }, CHIME_DURATION_MS + 250)
         try {
             val mp = MediaPlayer().apply {
                 setAudioAttributes(
@@ -261,7 +416,7 @@ class ListeningService : Service() {
                         .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                         .build()
                 )
-                val afd = resources.openRawResourceFd(R.raw.bmw_warning_chime)
+                val afd = resources.openRawResourceFd(R.raw.wake_chime)
                 setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
                 afd.close()
                 setOnCompletionListener { p -> p.release(); once() }
@@ -316,6 +471,17 @@ class ListeningService : Service() {
             ) {
                 Log.i(TAG, "👋 Goodbye detected in background conversation — ending")
                 endBackgroundConversation()
+                return
+            }
+
+            // 🔂 Continuous Chat OFF → answer once, then go back to the wake word.
+            // The isNotEmpty guard matters: a model turn with no user speech (a
+            // stray/empty turn, or a greeting) must not consume the single reply.
+            // The actual stop happens in onAudioPlaybackEnd() so the reply is heard
+            // in full instead of being cut off mid-sentence.
+            if (!isContinuousChatEnabled() && fullInput.trim().isNotEmpty()) {
+                Log.i(TAG, "🔂 Continuous Chat off — ending background session once this reply finishes")
+                endBackgroundSessionAfterCurrentReply("Continuous Chat off")
             }
         }
 
@@ -325,7 +491,18 @@ class ListeningService : Service() {
         }
 
         override fun onAudioPlaybackStart() {}
-        override fun onAudioPlaybackEnd() {}
+
+        override fun onAudioPlaybackEnd() {
+            // Single-reply mode: the answer has now been spoken in full, so close
+            // the session and hand control back to the wake word.
+            if (endSessionAfterPlayback) {
+                endSessionAfterPlayback = false
+                endSessionFallback?.let { mainHandler.removeCallbacks(it) }
+                endSessionFallback = null
+                Log.i(TAG, "🔂 Reply finished — closing background session, back to 'Hey IMI'")
+                endBackgroundConversation()
+            }
+        }
 
         override fun onError(error: String) {
             Log.e(TAG, "Background conversation error: $error")
@@ -363,6 +540,7 @@ class ListeningService : Service() {
                 "read_notifications" -> bgReadNotifications()
                 "send_message" -> bgSendMessage(args)
                 "read_emails" -> bgReadEmails()
+                "identify_song" -> bgIdentifySong()
                 "say_goodbye" -> { endBackgroundConversation(); "Goodbye!" }
                 "mute_ai" -> { endBackgroundConversation(); "Muting now." }
                 // Genuinely need the on-screen app (camera preview, meeting UI, media UI).
@@ -388,6 +566,20 @@ class ListeningService : Service() {
             }
         } catch (e: Exception) {
             "Could not retrieve weather: ${e.message}"
+        }
+    }
+
+    /**
+     * 🎵 Shazam-style song ID. Works screen-off: it reuses the PCM already being
+     * captured for this background conversation, so there's no camera, no UI and
+     * no second recorder involved — unlike play_music, which does need the app open.
+     */
+    private fun bgIdentifySong(): String {
+        return try {
+            kotlinx.coroutines.runBlocking { SongIdentifier.identifyFromLiveSession() }
+        } catch (e: Exception) {
+            Log.e(TAG, "Song identification failed: ${e.message}", e)
+            "I couldn't identify that song right now."
         }
     }
 

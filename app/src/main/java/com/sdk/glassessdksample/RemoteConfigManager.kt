@@ -13,6 +13,7 @@ object RemoteConfigManager {
     private const val KEY_OPENAI   = "openai_api_key"
     private const val KEY_PICOVOICE = "picovoice_key"
     private const val KEY_YOUTUBE  = "youtube_api_key"
+    private const val KEY_AUDD     = "audd_api_key"
 
     private val remoteConfig = Firebase.remoteConfig
 
@@ -27,7 +28,8 @@ object RemoteConfigManager {
                 KEY_GEMINI    to "",
                 KEY_OPENAI    to "",
                 KEY_PICOVOICE to "",
-                KEY_YOUTUBE   to ""
+                KEY_YOUTUBE   to "",
+                KEY_AUDD      to ""
             )
         )
     }
@@ -59,4 +61,8 @@ object RemoteConfigManager {
 
     val youtubeApiKey: String
         get() = remoteConfig.getString(KEY_YOUTUBE)
+
+    /** AudD music recognition token — set this in the Firebase console. */
+    val auddApiKey: String
+        get() = remoteConfig.getString(KEY_AUDD)
 }

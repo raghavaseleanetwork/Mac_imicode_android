@@ -96,13 +96,17 @@
         </activity>
 
         <!-- AUTHENTICATION SCREENS -->
-        <!-- <activity
+        <!-- Both are still referenced from code (SplashActivity's not-logged-in
+             branch and ProfileActivity.performLogout), so they must stay declared:
+             while commented out, reaching either path threw
+             ActivityNotFoundException and crashed the app. -->
+        <activity
             android:name=".LoginActivity"
             android:exported="false" />
-        
+
         <activity
             android:name=".SignUpActivity"
-            android:exported="false" /> -->
+            android:exported="false" />
         
         <activity
             android:name=".VerifyCodeActivity"

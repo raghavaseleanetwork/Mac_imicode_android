@@ -44,6 +44,21 @@ import org.greenrobot.eventbus.ThreadMode
 
 class DeviceBindActivity : BaseActivity() {
 
+    companion object {
+        /**
+         * Per-attempt HFP window (Mark 2). The observed refusal surfaced as
+         * CONNECTING → DISCONNECTED at ~12s, so this must sit comfortably past that
+         * to distinguish a slow link from a rejected one.
+         */
+        private const val HFP_ATTEMPT_TIMEOUT_MS = 15000L
+
+        /** Pause before re-issuing a refused HFP connect (Mark 2). */
+        private const val HFP_RETRY_BACKOFF_MS = 1500L
+
+        /** Retries after the initial attempt before reporting failure (Mark 2). */
+        private const val HFP_MAX_ATTEMPTS = 2
+    }
+
     private fun hasBluetoothConnectPermission(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
         return ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
@@ -67,6 +82,47 @@ class DeviceBindActivity : BaseActivity() {
     private var headsetProxy: BluetoothHeadset? = null
     private var hfpReceiverRegistered = false
     private var bondStateReceiverRegistered = false
+
+    /**
+     * True when binding Mark 2 glasses. The HFP hardening below is scoped to Mark 2
+     * so Mark 1's bind flow keeps its existing behaviour exactly.
+     */
+    private val isMark2: Boolean
+        get() = DevicePreferenceManager.getDeviceType(this) == DeviceType.MARK2
+
+    /**
+     * Guards the classic (HFP) connection flow so it runs once per bind.
+     *
+     * BLE emits CONNECTED repeatedly (initial connect, then again on each service
+     * re-discovery), and every event used to schedule another startClassicConnectionFlow.
+     * That produced overlapping passes — observed three in one bind — each opening its
+     * own headset proxy and its own timeout, which then cancelled each other through
+     * the shared handler. See HFP_TOKEN.
+     */
+    private var classicFlowStarted = false
+
+    /** Retry bookkeeping for the HFP connect attempt (Mark 2 only). */
+    private var hfpAttempt = 0
+
+    /**
+     * Token for HFP-related handler callbacks.
+     *
+     * cleanUpReceivers() used to call removeCallbacksAndMessages(null), which clears
+     * EVERY pending callback on mainHandler — including unrelated UI work such as the
+     * scanning dot animation. Posting HFP work under its own token lets us cancel just
+     * that work.
+     */
+    private val hfpToken = Any()
+
+    /**
+     * Token for the BLE auto-connect timeout that raises "Connection Timeout".
+     *
+     * This timeout has no success path of its own — it used to be cancelled only as a
+     * side effect of removeCallbacksAndMessages(null) elsewhere. Giving it a token
+     * lets cancelBleConnectTimeout() retire it precisely once the link is up, so the
+     * dialog can no longer appear over an already-connected device.
+     */
+    private val bleConnectToken = Any()
 
     private val connectingDotAnimRunnable = object : Runnable {
         override fun run() {
@@ -210,7 +266,18 @@ class DeviceBindActivity : BaseActivity() {
     @Subscribe(threadMode = ThreadMode.MAIN)
     fun onMessageEvent(event: BluetoothEvent) {
         if (event.type == BluetoothEvent.EventType.CONNECTED) {
+            // The link is up: retire the 30s "Connection Timeout" watchdog before it
+            // can fire over a device that connected successfully.
+            cancelBleConnectTimeout()
             dismissConnectingDialog()
+            // MARK 2 ONLY: BLE re-emits CONNECTED on every service re-discovery, so
+            // without this guard the classic flow starts several times over and the
+            // concurrent passes tear down each other's proxies and timeouts.
+            if (isMark2 && classicFlowStarted) {
+                Log.d("DeviceBindActivity", "↩️ Classic flow already running — ignoring duplicate BLE CONNECTED")
+                return
+            }
+            if (isMark2) classicFlowStarted = true
             Log.d("DeviceBindActivity", "✅ BLE Connected. Starting classic connection flow...")
             mainHandler.postDelayed({ connectedDeviceAddress?.let { startClassicConnectionFlow(it) } }, 500)
         }
@@ -218,7 +285,12 @@ class DeviceBindActivity : BaseActivity() {
 
     @SuppressLint("MissingPermission")
     private fun handleHfpConnectionSuccess() {
-        mainHandler.removeCallbacksAndMessages(null)
+        if (isMark2) {
+            hfpAttempt = 0
+            mainHandler.removeCallbacksAndMessages(hfpToken)
+        } else {
+            mainHandler.removeCallbacksAndMessages(null)
+        }
         Log.d("DeviceBindActivity", "🎧 HFP Connected (no forced SCO in bind flow)")
         Log.d("DeviceBindActivity", "✅ Both BLE and Audio connections active")
         setDeviceAliasIfSupported()
@@ -241,7 +313,15 @@ class DeviceBindActivity : BaseActivity() {
     }
 
     private fun cleanUpReceivers() {
-        mainHandler.removeCallbacksAndMessages(null)
+        // MARK 2: cancel only the HFP callbacks. removeCallbacksAndMessages(null)
+        // wipes EVERY pending callback on this handler — including other in-flight
+        // passes of this same flow and unrelated UI work like the dot animation —
+        // which is how concurrent passes used to cancel each other.
+        if (isMark2) {
+            mainHandler.removeCallbacksAndMessages(hfpToken)
+        } else {
+            mainHandler.removeCallbacksAndMessages(null)
+        }
         if (hfpReceiverRegistered) {
             try { unregisterReceiver(headsetConnectionReceiver) } catch (e: Exception) {}
             hfpReceiverRegistered = false
@@ -378,13 +458,16 @@ class DeviceBindActivity : BaseActivity() {
         BleOperateManager.getInstance().connectDirectly(address)
         showConnectingDialog(name)
         
-        // ⏱️ Set timeout for connection (increased from 10s to 30s for slower devices)
+        // ⏱️ Set timeout for connection (increased from 10s to 30s for slower devices).
+        // Tagged with bleConnectToken so cancelBleConnectTimeout() can retire it the
+        // moment the link comes up — otherwise it fires 30s later and shows
+        // "Connection Timeout" over glasses that are already connected.
         mainHandler.postDelayed({
             if (!isFinishing && !isDestroyed) {
                 dismissConnectingDialog()
                 showConnectionTimeoutDialog(address, name)
             }
-        }, 30000) // 30 second timeout (previously 10s - too quick)
+        }, bleConnectToken, 30000L)
         
         Log.d("DeviceBindActivity", "🔄 Auto-connecting to: $name")
     }
@@ -467,6 +550,17 @@ class DeviceBindActivity : BaseActivity() {
             registerReceiver(headsetConnectionReceiver, IntentFilter(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED))
             hfpReceiverRegistered = true
         }
+        // MARK 2 ONLY: retry instead of giving up on the first timeout, and never
+        // silently finish() back to home — a failed HFP link means all audio would
+        // come out of the phone, which the user cannot diagnose from the home screen.
+        if (isMark2) {
+            mainHandler.postDelayed(
+                { onHfpAttemptTimedOut() },
+                hfpToken,
+                HFP_ATTEMPT_TIMEOUT_MS
+            )
+            return
+        }
         mainHandler.postDelayed({
             if (hfpReceiverRegistered) {
                 Log.w("DeviceBindActivity", "HFP connection timed out.")
@@ -474,6 +568,112 @@ class DeviceBindActivity : BaseActivity() {
                 finish()
             }
         }, 15000)
+    }
+
+    /**
+     * MARK 2 ONLY. One HFP attempt ran out of time.
+     *
+     * Bluetooth stacks commonly refuse an HFP connect issued immediately after GATT
+     * service discovery — the observed failure was state CONNECTING → DISCONNECTED
+     * about 12s in, followed by an immediate finish() that dropped the user on the
+     * home screen with audio still routed to the phone. Retrying after a short
+     * backoff clears that transient refusal; only after the retries are exhausted do
+     * we surface a real error, and even then we stay on this screen so the user can
+     * retry rather than silently landing somewhere that looks connected.
+     */
+    @SuppressLint("MissingPermission")
+    private fun onHfpAttemptTimedOut() {
+        if (!hfpReceiverRegistered) return // already resolved
+
+        val address = connectedDeviceAddress
+        val device = if (address != null && hasBluetoothConnectPermission()) {
+            try { BluetoothAdapter.getDefaultAdapter().getRemoteDevice(address) } catch (e: Exception) { null }
+        } else null
+
+        // The broadcast can be missed if the link settled while we were not listening,
+        // so confirm against the live profile state before treating this as a failure.
+        val liveState = device?.let { d -> headsetProxy?.getConnectionState(d) }
+        if (liveState == BluetoothProfile.STATE_CONNECTED) {
+            Log.d("DeviceBindActivity", "✅ HFP is connected (observed on timeout check)")
+            handleHfpConnectionSuccess()
+            return
+        }
+
+        if (hfpAttempt < HFP_MAX_ATTEMPTS && device != null) {
+            hfpAttempt++
+            Log.w("DeviceBindActivity", "⚠️ HFP attempt $hfpAttempt/$HFP_MAX_ATTEMPTS timed out — retrying in ${HFP_RETRY_BACKOFF_MS}ms")
+            connectingStatusText?.text = "Connecting glasses audio… (attempt ${hfpAttempt + 1})"
+            mainHandler.postDelayed(
+                { retryHfpConnect(device) },
+                hfpToken,
+                HFP_RETRY_BACKOFF_MS
+            )
+            return
+        }
+
+        Log.e("DeviceBindActivity", "❌ HFP connection failed after ${hfpAttempt + 1} attempts")
+        cleanUpReceivers()
+        showHfpFailureDialog()
+    }
+
+    /** MARK 2 ONLY. Re-issue the HFP connect for a retry attempt. */
+    @SuppressLint("MissingPermission")
+    private fun retryHfpConnect(device: BluetoothDevice) {
+        val headset = headsetProxy
+        if (headset == null) {
+            // Proxy went away between attempts — re-acquire it; the profile listener
+            // routes back into attemptHfpConnection() once it reconnects.
+            Log.d("DeviceBindActivity", "Headset proxy gone — re-acquiring for retry")
+            BluetoothAdapter.getDefaultAdapter().getProfileProxy(this, profileListener, BluetoothProfile.HEADSET)
+            return
+        }
+        try {
+            val connectMethod = headset.javaClass.getMethod("connect", BluetoothDevice::class.java)
+            val success = connectMethod.invoke(headset, device) as? Boolean ?: false
+            Log.d("DeviceBindActivity", "HFP retry connect issued, success=$success")
+        } catch (e: Exception) {
+            Log.e("DeviceBindActivity", "Error invoking HFP connect on retry", e)
+        }
+        // Arm the next timeout regardless: a refused connect still needs to fall
+        // through to the next attempt or to the failure dialog.
+        mainHandler.postDelayed(
+            { onHfpAttemptTimedOut() },
+            hfpToken,
+            HFP_ATTEMPT_TIMEOUT_MS
+        )
+    }
+
+    /**
+     * MARK 2 ONLY. Report a genuine HFP failure instead of finishing to the home
+     * screen, where the glasses would look connected but all audio would play on the
+     * phone with no explanation.
+     */
+    private fun showHfpFailureDialog() {
+        if (isFinishing || isDestroyed) return
+        try {
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("Glasses audio not connected")
+                .setMessage(
+                    "The glasses are connected for data, but the audio (hands-free) " +
+                    "connection could not be established, so AI voice would play " +
+                    "through the phone.\n\nTry again, or forget and re-pair the " +
+                    "glasses in system Bluetooth settings."
+                )
+                .setPositiveButton("Retry") { d, _ ->
+                    d.dismiss()
+                    hfpAttempt = 0
+                    classicFlowStarted = false
+                    connectedDeviceAddress?.let { startClassicConnectionFlow(it) }
+                }
+                .setNegativeButton("Continue anyway") { d, _ ->
+                    d.dismiss()
+                    finish()
+                }
+                .setCancelable(false)
+                .show()
+        } catch (e: Exception) {
+            Log.w("DeviceBindActivity", "Could not show HFP failure dialog: ${e.message}")
+        }
     }
 
     private fun registerBondStateReceiver() {
@@ -771,9 +971,42 @@ class DeviceBindActivity : BaseActivity() {
     /**
      * 🆕 Show dialog when connection times out
      */
+    /**
+     * Retire the BLE auto-connect watchdog. Safe to call more than once.
+     */
+    private fun cancelBleConnectTimeout() {
+        mainHandler.removeCallbacksAndMessages(bleConnectToken)
+    }
+
+    /**
+     * Whether [address] currently has a live GATT link, asked of the system rather
+     * than of our own bookkeeping so a missed callback cannot make a connected
+     * device look disconnected.
+     */
+    @SuppressLint("MissingPermission")
+    private fun isDeviceCurrentlyConnected(address: String): Boolean {
+        if (!hasBluetoothConnectPermission()) return false
+        return try {
+            val manager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return false
+            manager.getConnectedDevices(BluetoothProfile.GATT)
+                .any { it.address.equals(address, ignoreCase = true) }
+        } catch (e: Exception) {
+            Log.w("DeviceBindActivity", "Could not query GATT connection state: ${e.message}")
+            false
+        }
+    }
+
     private fun showConnectionTimeoutDialog(address: String, name: String) {
         if (isFinishing || isDestroyed) return
-        
+
+        // Last-ditch guard: never claim a timeout for a device that is actually
+        // connected. The watchdog is cancelled on BLE CONNECTED, but if it was
+        // already queued on the main thread that cancellation can lose the race.
+        if (isDeviceCurrentlyConnected(address)) {
+            Log.d("DeviceBindActivity", "↩️ Suppressing Connection Timeout — $name is connected")
+            return
+        }
+
         AlertDialog.Builder(this)
             .setTitle("Connection Timeout")
             .setMessage("Could not connect to $name.\n\nMake sure glasses are:\n• Powered ON\n• In range\n• Not connected to another device")
@@ -791,6 +1024,10 @@ class DeviceBindActivity : BaseActivity() {
         @SuppressLint("MissingPermission")
         override fun onLeScan(device: BluetoothDevice?, rssi: Int, scanRecord: ByteArray?) {
             if (device == null || device.name.isNullOrEmpty()) return
+            val deviceName = device.name
+            val isAllowedDevice = deviceName.startsWith("Cyber", ignoreCase = true) ||
+                deviceName.startsWith("SANVNET", ignoreCase = true)
+            if (!isAllowedDevice) return
             val newDevice = SmartWatch(device.name, device.address, rssi = rssi)
             if (deviceList.any { it.deviceAddress == newDevice.deviceAddress }) return
             deviceList.add(newDevice)

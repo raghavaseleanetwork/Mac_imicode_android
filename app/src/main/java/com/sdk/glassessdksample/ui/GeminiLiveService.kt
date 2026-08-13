@@ -6,8 +6,8 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
-import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.media.SoundPool
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.media.audiofx.AutomaticGainControl
@@ -62,6 +62,13 @@ class GeminiLiveService(
     companion object {
         private const val TAG = "GeminiLiveService"
         
+        /**
+         * Camera/vision tools. Only Mark 2 has a handler for these
+         * (MainActivity.handleGeminiToolCall → VisionChatActivity), so they are
+         * filtered out of the declared tool list on Mark 1.
+         */
+        private val VISION_TOOL_NAMES = setOf("analyze_view", "capture_new_frame")
+
         // SharedPreferences key for model selection
         const val PREF_NAME = "imi_model_prefs"
         const val PREF_KEY_MODEL = "selected_model" // "gpt" or "gemini"
@@ -110,6 +117,32 @@ class GeminiLiveService(
         
         // Audio timeout: How long to wait for more audio before declaring end of speech
         private const val AUDIO_END_TIMEOUT_MS = 700L
+        // How long the first queued chunk of a turn may wait for the pre-buffer to
+        // fill before we play it anyway. Gemini streams chunks milliseconds apart, so
+        // a real multi-chunk reply always fills well inside this; only a reply that is
+        // genuinely shorter than PRE_BUFFER_COUNT hits the timeout.
+        private const val SHORT_REPLY_FLUSH_MS = 250L
+
+        // Upper bound on waiting for AudioTrack to play out its buffer, so a stalled
+        // track cannot wedge the playback loop.
+        private const val MAX_DRAIN_WAIT_MS = 3000L
+        // Extra settle time for A2DP's downstream buffering (headsets typically hold
+        // 100-200 ms) before we suspend the profile by taking SCO back.
+        private const val A2DP_TAIL_DRAIN_MS = 250L
+        // How long a Bluetooth SCO→A2DP handover takes before the headset actually
+        // emits sound. Playing the cue before this elapses means it is inaudible.
+        private const val ROUTE_SETTLE_MS = 350L
+        // Volume of the thinking cue. It plays alone (never under speech), so it can
+        // sit well above the old 0.35, which was inaudible on the glasses.
+        private const val THINKING_CUE_VOLUME = 0.7f
+        // Length of res/raw/processing_chime.wav (1071 ms), rounded up.
+        private const val CHIME_DURATION_MS = 1100L
+        // Hard cap on the looping cue. It exists only for the turn where no reply
+        // ever arrives — normally stopThinkingSound() ends the cue long before this.
+        // Sized past the slowest observed grounded turn (a Google Search reply took
+        // 3.81s from speech-end) with margin, but short enough that a stuck cue is a
+        // brief annoyance rather than an endless loop.
+        private const val MAX_CUE_MS = 8000L
         
         // Loudness settings
         private const val SOFTWARE_GAIN = 1.0f
@@ -126,7 +159,11 @@ class GeminiLiveService(
         // preview ID. If the key lacks native-audio access, fall back to
         // GEMINI_MODEL_FALLBACK (half-cascade Live), which is more widely enabled.
         private const val GEMINI_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
-        private const val GEMINI_MODEL_FALLBACK = "gemini-live-2.5-flash-preview"
+        // "gemini-live-2.5-flash-preview" is rejected by v1beta bidiGenerateContent
+        // with 1008 ("not found for API version v1beta"), so the fallback used to
+        // fail too and the session died with nothing spoken. This half-cascade Live
+        // model is served on v1beta.
+        private const val GEMINI_MODEL_FALLBACK = "gemini-2.0-flash-live-001"
         private const val GEMINI_VOICE = "Kore"
         private const val GEMINI_INPUT_SAMPLE_RATE = 16000
         private const val GEMINI_OUTPUT_SAMPLE_RATE = 24000
@@ -143,20 +180,108 @@ class GeminiLiveService(
          *
          * Set to false to restore the previous SCO-only behaviour if a particular
          * headset stutters or drops out with split routing.
+         *
+         * Kept TRUE for full-quality 24 kHz playback, but note that SCO and A2DP
+         * cannot run on the same device at the same time: holding SCO open suspends
+         * A2DP, the OS tears down the A2DP output track mid-stream, and the reply
+         * audio written to it is discarded. Observed in logcat during a reply:
+         *     AudioTrackShared  Track invalidated
+         *     AudioTrack        restoreTrack_l: dead IAudioTrack ... creating a new one
+         *     AudioTrack        releaseBuffer is no-op due to IAudioTrack sequence mismatch
+         * which presented as "the AI replies but I hear nothing" on the glasses while
+         * the phone speaker worked fine.
+         *
+         * The fix WAS time-division: SCO held only while listening, released while
+         * the AI speaks so A2DP has the device to itself. See
+         * releaseScoForPlayback()/reacquireScoForListening().
+         *
+         * NOW FALSE. Time-division does not survive on these glasses. Once the
+         * headset is connected for call audio (Bluetooth settings → "Phone calls"
+         * enabled — which is what finally gave us the glasses MIC), every turn has
+         * to tear down SCO, wait for A2DP to resume, play, then re-handshake SCO.
+         * That handover is slower than a conversational turn, so the reply lands on
+         * a route that is still switching and is discarded:
+         *     AudioTrack  releaseBuffer() ... disabled due to previous underrun
+         * i.e. the mic works but the user hears NOTHING back.
+         *
+         * SCO-only keeps one stable route for the whole session. The reply is
+         * narrowband call quality rather than 24 kHz, which is a real downgrade —
+         * but audible beats inaudible, and it removes a per-turn route switch that
+         * was also adding latency. Flip back to true only if a headset is verified
+         * to handle rapid SCO↔A2DP handover cleanly.
          */
-        private const val HIGH_QUALITY_PLAYBACK = true
+        private const val HIGH_QUALITY_PLAYBACK = false
         
         // Echo cancellation and noise suppression
         private const val ENERGY_THRESHOLD = 200.0
+
+        /**
+         * Quiet time that marks the end of a user turn, for the processing chime.
+         *
+         * Deliberately short — this is a debounce, not an artificial delay. It only
+         * has to outlast the natural pauses inside a sentence so the cue does not
+         * fire mid-question; anything longer would put dead air back into exactly
+         * the gap this feature exists to fill. It runs in PARALLEL with Gemini's own
+         * turn detection and never gates it: audio keeps streaming throughout, so
+         * the model's processing is not delayed by a single millisecond.
+         */
+        private const val VAD_SILENCE_MS = 450L
 
         // How many times to silently re-establish a dropped/failed connection
         // before surfacing the error to the user (covers transient Gemini hiccups
         // that previously required the user to manually "quick start" again).
         private const val MAX_AUTO_RECONNECTS = 2
+
+        /**
+         * How long to wait for the Bluetooth SCO route to actually come up after
+         * startBluetoothSco(). The call is asynchronous and the handshake commonly
+         * takes 500-2000ms; anything shorter races the OS and leaves audio on the
+         * phone. Bounded so a headset without HFP cannot stall session start.
+         *
+         * This is dead time the user experiences as lag: the mic does not open
+         * until the wait resolves, so on a device whose glasses never emit the
+         * CONNECTED broadcast the FULL timeout is burned on every wake-up before
+         * IMI can hear anything. 1200ms still covers a normal handshake while
+         * cutting ~1.8s of silence off the wake→listening path.
+         *
+         * Note the wait no longer GATES the SCO request — the caller asserts
+         * isBluetoothScoOn regardless of the result — so a timeout here costs
+         * latency only, not routing.
+         */
+        private const val SCO_ROUTE_TIMEOUT_MS = 1200L
     }
     
     // Active model provider (read from prefs at start)
     private var activeProvider: ModelProvider = getSavedModelProvider(context)
+
+    /**
+     * True when this session is running on Mark 2 glasses.
+     *
+     * This service is shared with Mark 1, whose SCO timing is already working, so
+     * the asynchronous-SCO wait added for Mark 2 is scoped to Mark 2 only and
+     * Mark 1 keeps its previous behaviour exactly.
+     */
+    private val isMark2: Boolean
+        get() = DevicePreferenceManager.getDeviceType(context) == DeviceType.MARK2
+
+    /**
+     * Whether a Bluetooth A2DP output actually exists right now.
+     *
+     * Split routing (mic on SCO, reply on A2DP) only works if the headset exposes
+     * A2DP at all. These glasses connect over HFP for call audio; if no A2DP
+     * endpoint is present, pinning playback to a media route sends the reply
+     * nowhere and the user hears silence.
+     */
+    private fun hasA2dpOutput(): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false
+            audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                ?.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP } == true
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not query A2DP availability: ${e.message}")
+            false
+        }
+    }
 
     // Gemini Live model actually used for the current connection. Starts at the
     // primary model and switches to the fallback if the primary returns 404.
@@ -228,13 +353,25 @@ class GeminiLiveService(
     private val isRecording = AtomicBoolean(false)
     private val isPlaying = AtomicBoolean(false)
     private val isSetupComplete = AtomicBoolean(false)
-    
+
+    // Text handed to speakText() before the session finished setup (or while it was
+    // reconnecting onto the fallback model). Flushed from setupComplete.
+    private val pendingSpeakLock = Any()
+    private var pendingSpeakText: Pair<String, Boolean>? = null
+
+
     // Echo cancellation and noise suppression
     private val isAIPlaying = AtomicBoolean(false) // Half-duplex flag: true when AI is speaking
     private var acousticEchoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
     private var automaticGainControl: AutomaticGainControl? = null
     
+    // 🎵 Rolling mic buffer for Shazam-style song identification.
+    // Allocated when audio capture starts, released on cleanup. Null when no
+    // live session is running, which is how identify_song knows it has no audio.
+    @Volatile
+    private var songIdBuffer: SongIdentifier.PcmRingBuffer? = null
+
     // Transcription state
     private var currentInputTranscription = StringBuilder()
     private var currentOutputTranscription = StringBuilder()
@@ -249,65 +386,235 @@ class GeminiLiveService(
     // 🆕 Mute functionality for vision chat integration
     private val isMuted = AtomicBoolean(false) // When true, blocks audio output (but keeps listening)
     
-    // 🎵 Thinking sound - plays during delay between user question and AI reply
-    private var thinkingPlayer: MediaPlayer? = null
+    // 🎵 Thinking sound - plays during delay between user question and AI reply.
+    //
+    // Uses SoundPool, NOT MediaPlayer. MediaPlayer opens its own output stream with
+    // default USAGE_MEDIA attributes; against our MODE_IN_COMMUNICATION session with
+    // AudioTrack pinned to A2DP that forces the OS to re-route Bluetooth on every
+    // start and stop. That re-route is what delayed the cue and left the AI reply
+    // silent — AudioTrack writes landed on a path that was still being torn down.
+    // SoundPool is built with the SAME AudioAttributes as the reply AudioTrack, so
+    // both share one stream and no re-routing happens. It also decodes into memory
+    // once up front, instead of MediaPlayer.create()'s synchronous main-thread
+    // decode on every single turn.
+    private var thinkingSoundPool: SoundPool? = null
+    private var thinkingSoundId: Int = 0
+    private var thinkingStreamId: Int = 0
+    private val isThinkingSoundLoaded = AtomicBoolean(false)
     private val isThinkingSoundPlaying = AtomicBoolean(false)
-    private val mainHandler = Handler(Looper.getMainLooper()) // Must use main thread for MediaPlayer
+
+    /**
+     * Guards publication of [thinkingStreamId] against a concurrent stop.
+     *
+     * The cue's play() is deferred by ROUTE_SETTLE_MS, so a reply can arrive while
+     * the start is still in flight. Without this, stop() could run between the
+     * "still wanted?" check and play() returning, leaving a loop=-1 stream running
+     * under the reply with no id recorded to stop it.
+     */
+    private val thinkingSoundLock = Any()
+
+    /** Token for the deferred cue start, so stopThinkingSound() can cancel it. */
+    private val thinkingCueToken = Any()
+    private val mainHandler = Handler(Looper.getMainLooper())
     
     /**
-     * 🎵 Start the thinking/processing sound (loops until AI starts speaking)
-     * Runs on main thread because MediaPlayer requires it
+     * 🎵 Load the thinking sound into memory once per session, so that starting it
+     * later is just a play() call with no decode.
      */
+    private fun initThinkingSound() {
+        if (thinkingSoundPool != null) return
+        try {
+            // Must use the SAME usage as the reply AudioTrack. A different usage lands
+            // on a different route and forces the Bluetooth stack to switch mid-turn,
+            // which is what made the cue delay and swallow the reply.
+            thinkingSoundPool = SoundPool.Builder()
+                .setMaxStreams(1)
+                .setAudioAttributes(
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                .build()
+                .apply {
+                    setOnLoadCompleteListener { _, _, status ->
+                        if (status == 0) {
+                            isThinkingSoundLoaded.set(true)
+                            Log.d(TAG, "🎵 Thinking sound loaded and ready")
+                        } else {
+                            Log.e(TAG, "🎵 Thinking sound failed to load, status=$status")
+                        }
+                    }
+                }
+            thinkingSoundId = thinkingSoundPool?.load(context, R.raw.processing_chime, 1) ?: 0
+        } catch (e: Exception) {
+            Log.e(TAG, "🎵 Error initialising thinking SoundPool: ${e.message}", e)
+        }
+    }
+
     private fun startThinkingSound() {
-        if (isThinkingSoundPlaying.get()) return // Already playing
-        mainHandler.post {
+        // Claim the slot atomically. Gemini streams inputTranscription in many partial
+        // fragments and each one calls in here, so a check-then-set would let several
+        // through before the first took effect.
+        if (!isThinkingSoundPlaying.compareAndSet(false, true)) {
+            // Guards edge case 1/7: one cue per user turn. Speech-end can be
+            // signalled more than once for a single turn (VAD flutter, or a
+            // transcript fragment arriving after the local VAD already fired).
+            Log.d(TAG, "🔊 Processing chime SKIPPED — already played for this turn")
+            return
+        }
+        val pool = thinkingSoundPool
+        if (pool == null || !isThinkingSoundLoaded.get()) {
+            // Not ready yet (very fast first turn) — skip this turn rather than block.
+            isThinkingSoundPlaying.set(false)
+            Log.w(TAG, "🔊 Processing chime SKIPPED — sample not decoded yet (first turn)")
+            return
+        }
+        Log.d(TAG, "🔊 PROCESSING CHIME TRIGGERED")
+        // The user has stopped speaking, so the mic is no longer needed. Hand the
+        // device to A2DP now: the cue and the reply that follows then share one
+        // stable route, with no switch in between to swallow the reply's start.
+        releaseScoForPlayback()
+        // A Bluetooth SCO→A2DP handover takes ~100-300 ms, during which the headset
+        // emits nothing. Playing immediately meant a short cue could finish inside
+        // that window and never be heard at all. Wait for the route to settle first.
+        mainHandler.postDelayed({
+            // The reply may have arrived while we were waiting; if the cue was
+            // stopped in the meantime, don't start it late over the top of speech.
+            if (!isThinkingSoundPlaying.get()) return@postDelayed
             try {
-                // Release previous player if any
-                thinkingPlayer?.let { p ->
-                    try { if (p.isPlaying) p.stop() } catch (_: Exception) {}
-                    try { p.release() } catch (_: Exception) {}
+                // loop=-1 → repeat until stopped, so the cue BRIDGES the whole gap
+                // instead of ending 1.07s in and leaving silence until the reply.
+                // On a grounded turn (Google Search) that gap runs 3-6s, which the
+                // one-shot version covered less than a third of.
+                //
+                // A loop that outlives its stop() would play underneath the reply,
+                // which is far worse than a short silence — so it is bounded twice:
+                //   1. stopThinkingSound() kills it on the reply's first audio byte
+                //      (five call sites: both providers' first-chunk handlers,
+                //      turnComplete/interrupted, response.done, barge-in, cleanup).
+                //   2. The MAX_CUE_MS watchdog below stops it unconditionally even
+                //      if every one of those is missed.
+                // No decode here: the sample is already in memory, so this returns
+                // immediately and never blocks the caller.
+                val streamId = pool.play(
+                    thinkingSoundId, THINKING_CUE_VOLUME, THINKING_CUE_VOLUME, 1, -1, 1.0f
+                )
+                // Re-check UNDER the lock after play(). stopThinkingSound() may have
+                // run between the check above and here — it would have found
+                // thinkingStreamId still 0 and stopped nothing, leaving this stream
+                // playing underneath the reply. Publishing the id and testing the
+                // flag together closes that window.
+                var started = false
+                synchronized(thinkingSoundLock) {
+                    if (isThinkingSoundPlaying.get()) {
+                        thinkingStreamId = streamId
+                        started = true
+                    } else {
+                        pool.stop(streamId)
+                    }
                 }
-                thinkingPlayer = null
-                
-                thinkingPlayer = MediaPlayer.create(context, R.raw.swar_chakra_thinking)?.apply {
-                    isLooping = true
-                    setVolume(0.35f, 0.35f) // 35% volume - subtle but audible
-                    start()
+                if (!started) {
+                    Log.d(TAG, "🔊 Processing chime stopped before it was audible — reply already arriving")
+                    return@postDelayed
                 }
-                if (thinkingPlayer != null) {
-                    isThinkingSoundPlaying.set(true)
-                    Log.d(TAG, "🎵 Thinking sound STARTED on main thread")
-                } else {
-                    Log.e(TAG, "🎵 MediaPlayer.create returned null! Check res/raw/swar_chakra_thinking.mp3")
-                }
+                Log.d(TAG, "🔊 PROCESSING CHIME PLAYING (stream=$streamId)")
+                // Watchdog. The cue now LOOPS, so unlike the one-shot version it will
+                // not end by itself — something must always stop it. Normally that is
+                // stopThinkingSound() on the reply; this is the backstop for the turn
+                // where no reply ever arrives (dropped socket, tool call that never
+                // returns) so the user is never left with a cue looping forever.
+                // Note this reuses thinkingCueToken, so stopThinkingSound() cancels
+                // it — that is correct, because stop() already clears the flag and
+                // stops the stream itself.
+                mainHandler.postDelayed({
+                    if (isThinkingSoundPlaying.compareAndSet(true, false)) {
+                        synchronized(thinkingSoundLock) {
+                            if (thinkingStreamId != 0) {
+                                try { pool.stop(thinkingStreamId) } catch (_: Exception) {}
+                                thinkingStreamId = 0
+                            }
+                        }
+                        Log.d(TAG, "🔊 PROCESSING CHIME STOPPED (max duration reached, no reply)")
+                    }
+                }, thinkingCueToken, MAX_CUE_MS)
             } catch (e: Exception) {
+                isThinkingSoundPlaying.set(false)
                 Log.e(TAG, "🎵 Error starting thinking sound: ${e.message}", e)
             }
-        }
+        }, thinkingCueToken, ROUTE_SETTLE_MS)
     }
-    
+
     /**
      * 🎵 Stop the thinking/processing sound (called when AI reply audio arrives)
-     * Runs on main thread for safety
      */
     private fun stopThinkingSound() {
-        if (!isThinkingSoundPlaying.get() && thinkingPlayer == null) return
-        isThinkingSoundPlaying.set(false) // Set immediately to prevent race conditions
-        mainHandler.post {
+        // Clearing the flag first also cancels any start still waiting out the
+        // route-settle delay (it re-checks the flag before playing).
+        val wasPlaying = isThinkingSoundPlaying.getAndSet(false)
+        // Cancel a queued start that has not run yet, so it cannot fire after this.
+        mainHandler.removeCallbacksAndMessages(thinkingCueToken)
+        synchronized(thinkingSoundLock) {
+            if (!wasPlaying && thinkingStreamId == 0) return
             try {
-                thinkingPlayer?.let { player ->
-                    try { if (player.isPlaying) player.stop() } catch (_: Exception) {}
-                    try { player.release() } catch (_: Exception) {}
+                if (thinkingStreamId != 0) {
+                    thinkingSoundPool?.stop(thinkingStreamId)
+                    thinkingStreamId = 0
+                    Log.d(TAG, "🔊 PROCESSING CHIME STOPPED (reply arriving)")
                 }
-                thinkingPlayer = null
-                Log.d(TAG, "🎵 Thinking sound STOPPED on main thread")
             } catch (e: Exception) {
                 Log.e(TAG, "🎵 Error stopping thinking sound: ${e.message}")
-                thinkingPlayer = null
+                thinkingStreamId = 0
             }
         }
     }
     
+    // ---- Local speech-end VAD state (capture thread only, no locking needed) ----
+    /** True once the user's voice has been heard in the current turn. */
+    private var speechActive = false
+    /** uptimeMillis of the last frame whose energy was above the speech threshold. */
+    private var lastVoiceFrameMs = 0L
+
+    /**
+     * Detect the user's speech ENDING, and fire the processing chime when it does.
+     *
+     * Called once per ~30 ms mic frame from the existing capture loop. It reuses
+     * [ENERGY_THRESHOLD] — the level this service already treats as "voice" — so
+     * this is not a second VAD with its own tuning, just an edge detector on the
+     * signal the capture loop is already producing.
+     *
+     * A turn ends when we have heard speech and then [VAD_SILENCE_MS] of quiet
+     * follows. The debounce exists because natural speech is full of short gaps
+     * (between words, before a subordinate clause); firing on the first quiet
+     * frame would chime in the middle of the user's sentence.
+     */
+    private fun detectSpeechEdge(frame: ShortArray, size: Int) {
+        // Mean absolute amplitude — same cheap energy measure as elsewhere here,
+        // and enough to separate speech from room noise.
+        var sum = 0L
+        for (i in 0 until size) sum += kotlin.math.abs(frame[i].toInt())
+        val energy = sum.toDouble() / size
+        val now = android.os.SystemClock.uptimeMillis()
+
+        if (energy > ENERGY_THRESHOLD) {
+            if (!speechActive) Log.d(TAG, "🎤 USER SPEECH STARTED")
+            speechActive = true
+            lastVoiceFrameMs = now
+            return
+        }
+
+        // Below threshold: this frame is silence.
+        if (speechActive && lastVoiceFrameMs != 0L && now - lastVoiceFrameMs >= VAD_SILENCE_MS) {
+            speechActive = false
+            lastVoiceFrameMs = 0L
+            Log.d(TAG, "🎤 USER SPEECH ENDED (${VAD_SILENCE_MS}ms silence)")
+            // Fire and forget. startThinkingSound() only flips an atomic and posts
+            // to the main handler, so the capture loop is never blocked on audio
+            // and the websocket keeps streaming underneath the cue.
+            startThinkingSound()
+        }
+    }
+
     /**
      * Start the live conversation session
      */
@@ -339,6 +646,8 @@ class GeminiLiveService(
         // Arm the proactive greeting and reset the reconnect budget for this session.
         greetOnConnect = greetOnStart
         autoReconnects = 0
+        // Never carry text queued for a previous session into this one.
+        synchronized(pendingSpeakLock) { pendingSpeakText = null }
         Log.d(TAG, "🔄 Starting with model provider: $activeProvider")
         
         val apiKey = if (activeProvider == ModelProvider.GPT_REALTIME) {
@@ -440,7 +749,18 @@ class GeminiLiveService(
             callbacks.onError("AI not connected")
             return
         }
-        
+
+        // The socket can be open while the server is still processing our setup
+        // message. Anything sent in that window is refused with 1007 and takes the
+        // whole session down, so hold the text and send it from setupComplete.
+        if (!isSetupComplete.get()) {
+            synchronized(pendingSpeakLock) {
+                pendingSpeakText = textToSpeak to speakDirectly
+            }
+            Log.d(TAG, "⏳ Queued text until session setup completes: ${textToSpeak.take(60)}...")
+            return
+        }
+
         try {
             val promptText = if (speakDirectly) {
                 "Read this COMPLETELY in one go, do not pause or stop in the middle: $textToSpeak"
@@ -482,7 +802,27 @@ class GeminiLiveService(
             callbacks.onError("Failed to speak: ${e.message}")
         }
     }
-    
+
+    /**
+     * Send any text that speakText() had to hold back because the session setup
+     * had not been acknowledged yet. Called from setupComplete / session.created.
+     *
+     * The queued entry survives a reconnect (model fallback, transient drop), so a
+     * vision result asked for on a dead session is still spoken on the new one
+     * instead of being silently dropped.
+     */
+    private fun flushPendingSpeakText() {
+        val pending = synchronized(pendingSpeakLock) {
+            val p = pendingSpeakText
+            pendingSpeakText = null
+            p
+        } ?: return
+
+        Log.d(TAG, "▶️ Flushing queued text now that setup is complete")
+        speakText(pending.first, pending.second)
+    }
+
+
     /**
      * 🆕 Inject vision context into Gemini Live's conversation memory
      * This adds the vision analysis to the conversation history so Gemini
@@ -621,6 +961,299 @@ class GeminiLiveService(
         }
     }
 
+    // Tracks whether we currently hold SCO, so the release/reacquire pair below is
+    // idempotent and cheap to call from the audio loop.
+    private val scoHeldForListening = AtomicBoolean(false)
+
+    // Total PCM frames handed to AudioTrack this session. Compared against the
+    // hardware playback head to know when the reply has really finished sounding.
+    @Volatile private var totalFramesWritten = 0L
+
+    /**
+     * Block until AudioTrack has actually played out everything written to it.
+     *
+     * Counts total frames written and waits for the hardware playback head
+     * (playbackHeadPosition) to catch up. Without this the reply's last words are
+     * lost whenever we change the Bluetooth route straight after the final write.
+     * Bounded so a stalled or silent track can never hang the playback loop.
+     */
+    private suspend fun waitForTrackToDrain() {
+        val track = audioTrack ?: return
+        try {
+            val deadline = System.currentTimeMillis() + MAX_DRAIN_WAIT_MS
+            while (System.currentTimeMillis() < deadline) {
+                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) break
+                // playbackHeadPosition is an unsigned frame counter that wraps; the
+                // mask keeps the comparison correct past 2^31 frames.
+                val played = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+                if (played >= totalFramesWritten) break
+                delay(10)
+            }
+            // A2DP adds its own buffering downstream of the track, so give the
+            // headset a moment to emit the final frames before we suspend it.
+            if (HIGH_QUALITY_PLAYBACK) delay(A2DP_TAIL_DRAIN_MS)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error waiting for track drain: ${e.message}")
+        }
+    }
+
+    /**
+     * Hand the Bluetooth device over to A2DP for the AI's reply.
+     *
+     * SCO and A2DP cannot be active on the same device simultaneously; while SCO is
+     * open the A2DP output track gets invalidated mid-stream and the reply is lost.
+     * We only need the mic while the user is talking, so we drop SCO for the
+     * duration of the reply and take it back afterwards.
+     */
+    private fun releaseScoForPlayback() {
+        if (!HIGH_QUALITY_PLAYBACK) return
+
+        // Only hand the device over to A2DP if an A2DP output actually exists.
+        //
+        // These glasses connect over HFP. With no A2DP endpoint, dropping SCO removes
+        // the ONLY route to the headset: the reply is written to a track with nowhere
+        // to go and the user hears silence ("AudioTrack ... disabled due to previous
+        // underrun"). Keep SCO for the whole turn in that case — call-quality audio
+        // that is audible beats high-quality audio that is not.
+        if (!hasA2dpOutput()) {
+            Log.d(TAG, "🔈 No A2DP output — keeping SCO for playback (call quality, audible)")
+            return
+        }
+
+        if (!scoHeldForListening.compareAndSet(true, false)) return
+        try {
+            audioManager?.let { am ->
+                am.isBluetoothScoOn = false
+                am.stopBluetoothSco()
+            }
+            Log.d(TAG, "🔉 SCO released — A2DP free for high-quality reply")
+        } catch (e: Exception) {
+            Log.w(TAG, "Error releasing SCO: ${e.message}")
+        }
+    }
+
+    /**
+     * Pin playback to the A2DP endpoint, now that SCO has actually been released.
+     *
+     * The pin in initializeAudioComponents() runs while SCO is held for listening,
+     * and A2DP is suspended (so absent from getDevices()) for exactly as long as
+     * SCO is up. That pin therefore always fell through to the SCO device and stuck
+     * there for the whole session — a USAGE_MEDIA track pinned to SCO under
+     * MODE_IN_COMMUNICATION is accepted by write() but never rendered, which is why
+     * the reply was silent while the logs looked healthy.
+     *
+     * Re-pinning per turn, after releaseScoForPlayback() and the route-settle delay,
+     * is the only point at which the A2DP endpoint is actually enumerable.
+     */
+    private fun repinPlaybackToA2dp() {
+        if (!HIGH_QUALITY_PLAYBACK) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        try {
+            val a2dp = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
+            if (a2dp != null) {
+                val ok = audioTrack?.setPreferredDevice(a2dp)
+                Log.d(TAG, "🎯 Playback re-pinned → ${a2dp.productName} [A2DP], success=$ok")
+            } else {
+                // No A2DP right now (SCO-only headset, or the profile has not come
+                // back yet). Clearing the stale pin lets the OS pick the live route
+                // instead of holding playback on a device that cannot render it.
+                audioTrack?.setPreferredDevice(null)
+                Log.d(TAG, "ℹ️ No A2DP endpoint — cleared pin, using system routing")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to re-pin playback device: ${e.message}")
+        }
+    }
+
+    /**
+     * Take SCO back so the microphone works again once the AI has finished speaking.
+     *
+     * On Mark 2 this suspends until the route is genuinely back, because
+     * startBluetoothSco() is asynchronous: returning early let mic capture resume
+     * while the phone mic was still the active input, so the glasses mic went dead
+     * after the first reply. Mark 1 returns immediately as before.
+     */
+    private suspend fun reacquireScoForListening() {
+        if (!HIGH_QUALITY_PLAYBACK) return
+        // Mirrors releaseScoForPlayback(): when there is no A2DP endpoint SCO was
+        // never released, so there is nothing to take back.
+        if (!hasA2dpOutput()) return
+        if (!scoHeldForListening.compareAndSet(false, true)) return
+        try {
+            // MARK 2 ONLY — see the matching note in initializeAudioComponents().
+            if (isMark2) {
+                // Register for the SCO state broadcast BEFORE asking for SCO, so a
+                // fast CONNECTED cannot be missed. isBluetoothScoOn is set only once
+                // the link is genuinely up — setting it up front is what made the old
+                // wait return in 0ms and tear down the playback track mid-reply.
+                val connected = awaitScoConnected(SCO_ROUTE_TIMEOUT_MS) {
+                    audioManager?.startBluetoothSco()
+                }
+                if (connected) {
+                    audioManager?.isBluetoothScoOn = true
+                    Log.d(TAG, "🎙️ SCO reacquired — microphone live again")
+                } else {
+                    Log.w(TAG, "⚠️ SCO did not come back within ${SCO_ROUTE_TIMEOUT_MS}ms — " +
+                            "microphone may fall back to the phone")
+                }
+            } else {
+                audioManager?.let { am ->
+                    am.startBluetoothSco()
+                    am.isBluetoothScoOn = true
+                }
+                Log.d(TAG, "🎙️ SCO reacquired — microphone live again")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error reacquiring SCO: ${e.message}")
+            scoHeldForListening.set(false) // allow a retry next turn
+        }
+    }
+
+    /**
+     * Route voice capture to the Bluetooth headset using the modern, supported
+     * API (Android 12 / API 31+).
+     *
+     * The app's original path asked the system for HFP through reflection on the
+     * hidden BluetoothHeadset.connect(), which Android has blocklisted as a
+     * non-SDK interface since Android 11. On a modern device that call simply
+     * returns false ("HFP connect command failed immediately"), so HFP never
+     * reaches STATE_CONNECTED and capture falls back to the PHONE mic while the
+     * glasses sit there connected over BLE.
+     *
+     * setCommunicationDevice() replaces that: it asks the framework to route
+     * communication audio to the chosen device and brings SCO up itself, with no
+     * hidden APIs involved.
+     *
+     * @return true if a Bluetooth SCO communication device was selected.
+     */
+    private fun selectBluetoothCommunicationDevice(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+        val am = audioManager ?: return false
+        return try {
+            val current = am.communicationDevice
+            if (current?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                Log.d(TAG, "🎧 Communication device already on Bluetooth SCO (${current.productName})")
+                return true
+            }
+            val bt = am.availableCommunicationDevices
+                .firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            if (bt == null) {
+                Log.w(TAG, "⚠️ No Bluetooth SCO communication device offered by the system — " +
+                        "the glasses may not expose HFP, or are not connected as a headset")
+                return false
+            }
+            val ok = am.setCommunicationDevice(bt)
+            Log.d(TAG, "🎧 setCommunicationDevice(${bt.productName}) → $ok")
+            ok
+        } catch (e: Exception) {
+            Log.w(TAG, "setCommunicationDevice failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Wait until the Bluetooth SCO route is genuinely usable.
+     *
+     * Waits on ACTION_SCO_AUDIO_STATE_UPDATED rather than polling AudioManager.
+     *
+     * The previous polling version always returned in 0ms and so never actually
+     * waited. Both of the signals it checked are true the instant the caller asks
+     * for SCO, long before the link exists:
+     *  - isBluetoothScoOn reflects the REQUEST made by setBluetoothScoOn(true) on
+     *    the line above the call, not the state of the link.
+     *  - a TYPE_BLUETOOTH_SCO entry stays enumerable between sessions, because the
+     *    headset supports HFP whether or not SCO is currently up.
+     *
+     * Returning early let the mic resume while the real handover was still in
+     * flight; that handover then landed underneath the playback AudioTrack and
+     * invalidated it ("dead IAudioTrack ... creating a new one" every ~500ms in
+     * logcat), which is what made the AI reply silent.
+     *
+     * SCO_AUDIO_STATE_CONNECTED is the only signal the OS emits when the link is
+     * genuinely up, so we suspend on it. Returns false if [timeoutMs] elapses or
+     * the OS reports SCO_AUDIO_STATE_ERROR (e.g. a BLE-only headset with no HFP),
+     * in which case the caller falls back to default routing rather than blocking.
+     *
+     * Must be called BEFORE startBluetoothSco(), so the receiver is registered in
+     * time to see a fast CONNECTED broadcast.
+     */
+    private suspend fun awaitScoConnected(timeoutMs: Long, startSco: () -> Unit): Boolean {
+        val am = audioManager ?: return false
+
+        // Preferred path on API 31+. When this succeeds the framework owns the
+        // SCO handover, so there is nothing to wait for and no legacy
+        // startBluetoothSco() handshake to race.
+        if (selectBluetoothCommunicationDevice()) return true
+
+        // Already connected — nothing to wait for. Checked against the broadcast's
+        // sticky value rather than isBluetoothScoOn, which lies as described above.
+        return withTimeoutOrNull(timeoutMs) {
+            suspendCancellableCoroutine<Boolean> { cont ->
+                val started = System.currentTimeMillis()
+                // Unregister exactly once, whether we finish via CONNECTED, ERROR,
+                // or the withTimeoutOrNull above cancelling us.
+                val unregistered = AtomicBoolean(false)
+                var receiver: BroadcastReceiver? = null
+                val cleanup = {
+                    if (unregistered.compareAndSet(false, true)) {
+                        try { receiver?.let { context.unregisterReceiver(it) } } catch (_: Exception) {}
+                    }
+                }
+
+                receiver = object : BroadcastReceiver() {
+                    override fun onReceive(context: Context?, intent: Intent?) {
+                        val state = intent?.getIntExtra(
+                            AudioManager.EXTRA_SCO_AUDIO_STATE,
+                            AudioManager.SCO_AUDIO_STATE_ERROR
+                        ) ?: return
+                        when (state) {
+                            AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
+                                val waited = System.currentTimeMillis() - started
+                                Log.d(TAG, "✅ SCO route is live after ${waited}ms")
+                                cleanup()
+                                if (cont.isActive) cont.resume(true)
+                            }
+                            AudioManager.SCO_AUDIO_STATE_ERROR -> {
+                                Log.w(TAG, "⚠️ SCO reported ERROR while connecting")
+                                cleanup()
+                                if (cont.isActive) cont.resume(false)
+                            }
+                            // DISCONNECTED/CONNECTING are transient here: the link is
+                            // still coming up, so keep waiting for CONNECTED.
+                        }
+                    }
+                }
+
+                try {
+                    context.registerReceiver(
+                        receiver,
+                        IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not register SCO state receiver: ${e.message}")
+                    unregistered.set(true) // nothing to unregister
+                    if (cont.isActive) cont.resume(false)
+                    return@suspendCancellableCoroutine
+                }
+
+                cont.invokeOnCancellation { cleanup() }
+
+                // Ask for SCO only now that we are listening for the result.
+                try {
+                    startSco()
+                } catch (e: Exception) {
+                    Log.w(TAG, "startBluetoothSco failed: ${e.message}")
+                    cleanup()
+                    if (cont.isActive) cont.resume(false)
+                }
+            }
+        } ?: run {
+            Log.w(TAG, "⚠️ SCO did not connect within ${timeoutMs}ms")
+            false
+        }
+    }
+
     private suspend fun initializeAudioComponents() {
     Log.d(TAG, "🎧 ======================================")
     Log.d(TAG, "🎧 AUDIO INITIALIZATION STARTED")
@@ -632,21 +1265,24 @@ class GeminiLiveService(
         throw IllegalStateException("AudioManager not available")
     }
     Log.d(TAG, "✅ AudioManager obtained")
-    
+
+    // Decode the thinking cue into memory now, while we are already off the main
+    // thread, so the first turn does not pay for it.
+    initThinkingSound()
+
     // ========== OPTION A: Use System Bluetooth for Audio ==========
     // BLE handles data (photos, commands) - System Bluetooth handles audio
     
-    // 1. Audio mode.
-    //    MODE_IN_CALL puts the whole device into telephony mode, which forces every
-    //    stream through the narrowband SCO path — that is a big part of why the
-    //    glasses sounded muffled. MODE_IN_COMMUNICATION still gives us SCO mic
-    //    capture but leaves media playback free to use high-quality A2DP.
-    audioManager?.mode = if (HIGH_QUALITY_PLAYBACK) {
-        AudioManager.MODE_IN_COMMUNICATION
-    } else {
-        AudioManager.MODE_IN_CALL
-    }
-    Log.d(TAG, "📞 Audio mode: ${if (HIGH_QUALITY_PLAYBACK) "IN_COMMUNICATION (A2DP playback allowed)" else "IN_CALL"}")
+    // 1. Audio mode. ALWAYS MODE_IN_COMMUNICATION.
+    //
+    //    MODE_IN_CALL is reserved for real telephony: a normal app cannot route
+    //    playback through it, so selecting it here (the old SCO-only branch) makes
+    //    the reply inaudible in a different way than the A2DP handover did.
+    //    MODE_IN_COMMUNICATION is the correct mode for VoIP-style audio and gives
+    //    us SCO mic capture plus playback on the same SCO link.
+    audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+    Log.d(TAG, "📞 Audio mode: IN_COMMUNICATION " +
+            "(playback ${if (HIGH_QUALITY_PLAYBACK) "via A2DP split routing" else "over SCO — one stable route"})")
     
     // 2. Check if Bluetooth audio is available
     val isBluetoothAvailable = audioManager?.isBluetoothScoAvailableOffCall == true
@@ -667,10 +1303,53 @@ class GeminiLiveService(
                 audioManager?.stopBluetoothSco()
                 delay(80)
             }
-            audioManager?.startBluetoothSco()
-            audioManager?.isBluetoothScoOn = true
-            Log.d(TAG, "📡 Bluetooth SCO (re-)started for this session")
-            delay(80)
+            scoHeldForListening.set(true) // keep the release/reacquire pair in sync
+
+            // MARK 2 ONLY. startBluetoothSco() is ASYNCHRONOUS: it returns
+            // immediately and the SCO route only becomes usable once the OS has
+            // finished the handshake (typically 500-2000ms). The fixed 80ms delay
+            // used here expired long before that on Mark 2, so the device
+            // enumeration below found no SCO endpoint, setPreferredDevice() was
+            // never called, and BOTH the mic and playback silently fell back to the
+            // phone — the glasses connected but all audio came out of the handset.
+            // Wait for the route to really appear instead.
+            //
+            // isBluetoothScoOn is set only AFTER the link reports CONNECTED. Setting
+            // it before the wait is what let the old poll succeed instantly.
+            //
+            // Mark 1 keeps the original fixed delay: its timing already works and
+            // this fix is deliberately scoped to Mark 2.
+            if (isMark2) {
+                val scoReady = awaitScoConnected(SCO_ROUTE_TIMEOUT_MS) {
+                    audioManager?.startBluetoothSco()
+                }
+                // REGRESSION FIX: assert the SCO request whether or not the
+                // CONNECTED broadcast arrived in time.
+                //
+                // This used to be `if (scoReady) { isBluetoothScoOn = true }`, so on a
+                // device where the broadcast never lands the flag was NEVER set, SCO
+                // routing never engaged, and both mic and playback fell back to the
+                // phone — the glasses stayed silent even though the link was fine.
+                // The previously-working code set this unconditionally right after
+                // startBluetoothSco() and let the OS finish the handshake in the
+                // background; waiting is still useful (it lets a fast handshake
+                // proceed immediately) but it must not GATE the request.
+                audioManager?.isBluetoothScoOn = true
+                if (scoReady) {
+                    Log.d(TAG, "📡 Bluetooth SCO connected for this session")
+                } else {
+                    Log.w(TAG, "⚠️ SCO CONNECTED broadcast not seen within ${SCO_ROUTE_TIMEOUT_MS}ms — " +
+                            "keeping the SCO request active anyway and letting the OS finish routing")
+                    // Give the in-flight handshake the same brief settle the working
+                    // Mark 1 path uses, so the device enumeration below can see it.
+                    delay(80)
+                }
+            } else {
+                audioManager?.startBluetoothSco()
+                audioManager?.isBluetoothScoOn = true
+                Log.d(TAG, "📡 Bluetooth SCO (re-)started for this session")
+                delay(80)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "SCO start attempt: ${e.message}")
         }
@@ -756,12 +1435,25 @@ class GeminiLiveService(
             }
         }
 
-        // 8. Create AudioTrack for speaker output (auto-routes to Bluetooth)
-        // Using USAGE_MEDIA for crystal clear audio quality like Gemini Chat
+        // 8. Create AudioTrack for speaker output (auto-routes to Bluetooth).
+        //
+        //    The usage MUST match the routing strategy:
+        //    - Split routing (HIGH_QUALITY_PLAYBACK=true): USAGE_MEDIA is what makes
+        //      the A2DP high-quality route eligible at all. It only actually lands
+        //      there while SCO is released — see releaseScoForPlayback().
+        //    - SCO-only (false): USAGE_MEDIA is NOT carried over the SCO link under
+        //      MODE_IN_COMMUNICATION. The track is accepted and write() succeeds, but
+        //      nothing is rendered to the headset — silent replies with healthy-looking
+        //      logs. USAGE_VOICE_COMMUNICATION is the usage that routes to SCO.
+        val playbackUsage = if (HIGH_QUALITY_PLAYBACK) {
+            android.media.AudioAttributes.USAGE_MEDIA
+        } else {
+            android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION
+        }
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
                 android.media.AudioAttributes.Builder()
-                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)  // Better quality than VOICE_COMMUNICATION
+                    .setUsage(playbackUsage)
                     .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
@@ -866,7 +1558,14 @@ class GeminiLiveService(
                 Log.d(TAG, "✅ Response code: ${response.code}")
                 Log.d(TAG, "✅ ======================================")
                 this@GeminiLiveService.webSocket = webSocket
-                callbacks.onConnectionStatusChanged(true)
+                isSetupComplete.set(false)
+
+                // NOTE: "connected" is deliberately NOT reported here. The socket
+                // being open only means the transport is up - the server has not
+                // seen our setup message yet, and anything sent before it lands is
+                // rejected with 1007 (INVALID_ARGUMENT), killing the session.
+                // Listeners are told we're connected once setup is acknowledged
+                // (setupComplete / session.created).
 
                 // Send session configuration
                 Log.d(TAG, "📤 Sending setup message...")
@@ -981,6 +1680,47 @@ class GeminiLiveService(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "🔒 WebSocket closed: $code - $reason")
+
+                // 🆕 A server-side rejection arrives here as a close frame, NOT via
+                // onFailure - so the model-fallback / auto-reconnect logic in
+                // onFailure never saw it and the session just died silently, with
+                // nothing ever spoken.
+                //
+                // 1007 (INVALID_ARGUMENT) means the server refused our setup
+                // message - most often because the configured Live model isn't
+                // enabled for this API key. Retry once on the more widely-enabled
+                // fallback model, mirroring the 404 handling in onFailure.
+                val configRejected = code == 1007 ||
+                    reason.contains("invalid argument", ignoreCase = true)
+                if (activeProvider == ModelProvider.GEMINI_LIVE &&
+                    configRejected &&
+                    !triedGeminiFallback
+                ) {
+                    triedGeminiFallback = true
+                    activeGeminiModel = GEMINI_MODEL_FALLBACK
+                    Log.w(TAG, "⚠️ Setup rejected ($code: $reason) - retrying with $activeGeminiModel")
+                    this@GeminiLiveService.webSocket = null
+                    isSetupComplete.set(false)
+                    scope.launch {
+                        try {
+                            connectWebSocket(lastApiKey, lastSystemInstruction)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Fallback reconnect failed: ${e.message}")
+                            callbacks.onError("Connection failed: ${e.message}")
+                            callbacks.onConnectionStatusChanged(false)
+                            cleanup()
+                        }
+                    }
+                    return
+                }
+
+                if (configRejected) {
+                    // Surface it instead of failing silently - otherwise the user
+                    // just sees the screen close with no answer and no explanation.
+                    Log.e(TAG, "❌ Gemini Live rejected the session setup ($code: $reason)")
+                    callbacks.onError("AI rejected the session setup: $reason")
+                }
+
                 callbacks.onConnectionStatusChanged(false)
                 cleanup()
             }
@@ -994,7 +1734,7 @@ class GeminiLiveService(
      */
     private fun sendSetupMessage(webSocket: WebSocket, systemInstruction: String) {
         // Define tools/functions for OpenAI Realtime format
-        val tools = listOf(
+        val allTools = listOf(
             mapOf(
                 "type" to "function",
                 "name" to "make_phone_call",
@@ -1280,8 +2020,41 @@ class GeminiLiveService(
                     "type" to "object",
                     "properties" to mapOf<String, Any>()
                 )
+            ),
+            mapOf(
+                "type" to "function",
+                "name" to "identify_song",
+                "description" to "Identify the music currently playing around the user, like Shazam. Use whenever the user asks what song is playing, e.g. 'what song is this', 'tell me what song this is', 'what's this track', 'who sings this', 'name this song', 'kaunsa gaana hai ye', 'ye gaana kaunsa hai'. This listens to the ambient audio already being captured — do NOT ask the user to hold the phone up or play the song again, just call it.",
+                "parameters" to mapOf(
+                    "type" to "object",
+                    "properties" to mapOf<String, Any>()
+                )
             )
         )
+
+        // 👁️ Vision is Mark 2 only. Mark 1's tool handler (Mark1MainActivity /
+        // ListeningService) has no analyze_view / capture_new_frame case, so
+        // declaring them there only gets the model to call something that comes
+        // back "not yet implemented" — worse than not offering them at all.
+        val tools = if (isMark2) {
+            allTools
+        } else {
+            allTools.filterNot { (it["name"] as? String) in VISION_TOOL_NAMES }
+        }
+
+        // 👁️ Every other tool in this list has an explicit "call this when the
+        // user says X" section below. Vision had none, so with the "reply FAST
+        // and CONCISELY" rule above the model just answered "what is in front of
+        // me" verbally instead of calling analyze_view — and nothing opened.
+        // Mark 2 only, matching the tool gating above.
+        val visionInstruction = if (isMark2) """
+
+VISION - SEEING THROUGH THE GLASSES CAMERA: You CAN see. The glasses have a camera and analyze_view takes a fresh photo through it and describes it.
+When the user asks about anything in their surroundings - "what is in front of me", "what's this", "what do you see", "who is in front of me", "describe this", "what am I looking at", "read this for me", "mere samne kya hai", "ye kya hai", "kya dikh raha hai", "dekho kya hai" - call analyze_view IMMEDIATELY. Pass what they actually asked in the 'question' parameter.
+Call the tool FIRST, before saying anything. Do not describe the scene from memory or guess.
+NEVER say you cannot see, that you have no camera, that you are only a voice assistant, or ask the user to send/describe a photo. That is wrong - you have a camera, so use it.
+If the user then asks about something NEW after already getting a description, call capture_new_frame to take a fresh photo rather than reusing the old one.
+""" else ""
 
         // Enhanced system instruction
         val enhancedInstruction = """$systemInstruction
@@ -1303,10 +2076,12 @@ NOTIFICATIONS: You CAN read the user's phone notifications. When the user asks "
 
 SILENT MODE: When the user asks you to be quiet, go silent, stop talking, mute yourself, or similar (in any language, e.g. "chup ho jao", "shaant ho jao"), call the enter_silent_mode tool. Give a single very short spoken acknowledgement (like "Okay") and then stay quiet. When the user later asks you to speak again, talk, unmute, or exit silent mode (e.g. "wapas bolo"), call the exit_silent_mode tool and give a short spoken confirmation that you're back.
 
+SONG IDENTIFICATION: When the user asks what song or music is playing (in any language), call identify_song. It listens to the audio already around you, so never ask the user to replay the song or hold up the phone. Report the result naturally in one short line, like "That's Warriors by Imagine Dragons." If it comes back saying it couldn't identify the song, just say so briefly without apologising at length.
+
 EMAIL - READING: When the user asks about new emails, their inbox, or unread mail, call read_emails and tell them the result briefly.
 
 EMAIL - SENDING (always confirm first): When the user asks you to email or write to someone, call draft_email with your best guess at recipient, subject, and body from what they said. Then READ THE DRAFT BACK to the user out loud in your own next spoken turn (recipient, subject, and a short summary of the body) and ask "should I send it?". Do NOT call confirm_send_email in the same turn as draft_email. Only call confirm_send_email in a LATER turn, after the user has explicitly agreed (e.g. "yes", "send it", "go ahead"). If the user wants changes, call draft_email again with the corrected details and read it back again. If the user declines, do not send anything.
-"""
+$visionInstruction"""
 
         if (activeProvider == ModelProvider.GPT_REALTIME) {
             // ====== OpenAI Realtime: session.update event ======
@@ -1394,6 +2169,12 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
             try {
                 audioRecord?.startRecording()
                 isRecording.set(true)
+                // Fresh VAD state per session, so a previous conversation cannot
+                // leave us "mid-turn" and chime on the first frame of this one.
+                speechActive = false
+                lastVoiceFrameMs = 0L
+                // Start the song-ID rolling window alongside the session.
+                songIdBuffer = SongIdentifier.PcmRingBuffer(inputSampleRate)
                 Log.d(TAG, "🎤 Audio capture started (${inputSampleRate}Hz for $activeProvider)")
 
                 // Buffer: ~30ms worth of samples
@@ -1407,12 +2188,46 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
                     val readSize = audioRecord?.read(buffer, 0, bufferSize) ?: 0
                     
                     if (readSize > 0) {
+                        // 🎵 Song-ID tee — MUST stay ABOVE the half-duplex check below.
+                        // That check drops mic frames while the AI is speaking, which is
+                        // right for the websocket (it prevents echo) but wrong for music
+                        // fingerprinting: a clip with gaps punched in it fails to match
+                        // and AudD returns error #300. Teeing here keeps the rolling
+                        // window continuous regardless of what Imi is doing.
+                        songIdBuffer?.let { ring ->
+                            val raw = shortArrayToByteArray(buffer, readSize)
+                            ring.write(raw, raw.size)
+                        }
+
+                        // Don't stream mic audio before the server has acknowledged
+                        // setup - those frames are refused (1007) and take the
+                        // session down with them. Drop them; the user hasn't been
+                        // prompted to speak yet at this point anyway.
+                        if (!isSetupComplete.get()) {
+                            continue
+                        }
+
                         // Half-duplex: Skip sending audio when AI is speaking (prevents echo)
                         if (isAIPlaying.get()) {
                             halfDuplexSkips++
+                            // The mic is muted while Imi talks, so the VAD would see
+                            // this as silence and fire a bogus speech-end. Reset it
+                            // instead: the next real user turn starts from scratch.
+                            speechActive = false
+                            lastVoiceFrameMs = 0L
                             continue
                         }
-                        
+
+                        // ---- Local speech-end VAD (drives the processing chime) ----
+                        // This is the EARLIEST point at which we can know the user has
+                        // stopped talking — it reads the same mic frames already being
+                        // streamed, before Gemini has received, transcribed, or
+                        // responded to any of them. Gemini Live has no speech_stopped
+                        // event, so without this the cue could only be hung off
+                        // inputTranscription, which lands far too late to fill the gap.
+                        // Cheap enough to sit inline: one pass over a 30 ms frame.
+                        detectSpeechEdge(buffer, readSize)
+
                         // Convert PCM16 to base64
                         val pcmData = shortArrayToByteArray(buffer, readSize)
                         val base64Data = Base64.encodeToString(pcmData, Base64.NO_WRAP)
@@ -1463,6 +2278,16 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
             }
         }
     }
+
+    /**
+     * 🎵 Most recent [seconds] of mic audio as raw PCM16 mono, for song
+     * identification. Null if no live session is capturing, or if the rolling
+     * window hasn't filled yet. See [SongIdentifier].
+     */
+    fun getSongIdClip(seconds: Int): ByteArray? = songIdBuffer?.lastSeconds(seconds)
+
+    /** Sample rate of the audio returned by [getSongIdClip] (16k Gemini / 24k GPT). */
+    fun songIdSampleRate(): Int = inputSampleRate
 
         // Send image over WebSocket for GPT Realtime vision analysis
         // Note: OpenAI Realtime API supports images via conversation.item.create
@@ -1535,26 +2360,64 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
         scope.launch {
             try {
                 audioTrack?.play()
+                totalFramesWritten = 0L // playback head starts at 0 with the track
                 isPlaying.set(true)
                 isPreBuffering = true // Start in pre-buffering mode
                 var lastAudioTime = 0L // Track when we last played audio
                 Log.d(TAG, "🔊 Audio playback started (pre-buffering enabled, PRE_BUFFER_COUNT=$PRE_BUFFER_COUNT)")
 
+                // When the first chunk of a turn lands, we start a short grace window.
+                // If PRE_BUFFER_COUNT chunks arrive within it we start normally; if the
+                // reply is shorter than that, the window expires and we play what we
+                // have. This is measured per-turn from the first chunk, so unlike a
+                // "turn ended" latch it can never leak into a later turn and cause a
+                // premature one-chunk flush.
+                var firstChunkTime = 0L
+
                 while (isPlaying.get()) {
                     // Pre-buffering: Wait until we have enough chunks for smooth playback
                     val queueSize = synchronized(audioQueueLock) { audioQueue.size }
-                    
-                    if (isPreBuffering && queueSize < PRE_BUFFER_COUNT) {
+
+                    if (isPreBuffering && queueSize == 0) {
+                        firstChunkTime = 0L // nothing pending; reset the window
+                        delay(1)
+                        continue
+                    }
+
+                    if (isPreBuffering && firstChunkTime == 0L && queueSize > 0) {
+                        firstChunkTime = System.currentTimeMillis()
+                    }
+
+                    val waitedMs = if (firstChunkTime == 0L) 0L
+                                   else System.currentTimeMillis() - firstChunkTime
+                    val flushNow = queueSize > 0 && waitedMs >= SHORT_REPLY_FLUSH_MS
+
+                    if (isPreBuffering && queueSize < PRE_BUFFER_COUNT && !flushNow) {
                         delay(1) // Ultra-fast polling for instant start
                         continue
                     }
-                    
-                    if (isPreBuffering && queueSize >= PRE_BUFFER_COUNT) {
+
+                    if (isPreBuffering && (queueSize >= PRE_BUFFER_COUNT || flushNow)) {
                         isPreBuffering = false
+                        firstChunkTime = 0L
                         isAIPlaying.set(true) // AI is speaking, pause mic capture EARLY
+                        // Give the Bluetooth device to A2DP before we write a single
+                        // byte, otherwise the output track is torn down mid-reply.
+                        releaseScoForPlayback()
+                        // stopBluetoothSco() is asynchronous like its start: A2DP only
+                        // becomes the live route a moment later. Writing immediately
+                        // meant the first chunks landed on a track the OS was still
+                        // tearing down ("Track invalidated" 2ms after playback start),
+                        // and re-pinning below while SCO was still up chose the wrong
+                        // device. Let the route settle, then pin to the A2DP endpoint
+                        // that is only now enumerable.
+                        delay(ROUTE_SETTLE_MS)
+                        repinPlaybackToA2dp()
                         callbacks.onAudioPlaybackStart()
                         lastAudioTime = System.currentTimeMillis()
-                        Log.d(TAG, "✅ Pre-buffer filled ($queueSize chunks), starting smooth playback")
+                        val why = if (flushNow) "short-reply flush after ${waitedMs}ms"
+                                  else "pre-buffer filled"
+                        Log.d(TAG, "🔊 GEMINI RESPONSE PLAYBACK STARTED ($queueSize chunks, $why)")
                     }
                     
                     // Play ALL available chunks in one go for smooth continuous audio
@@ -1580,7 +2443,17 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
                         val timeSinceLastAudio = System.currentTimeMillis() - lastAudioTime
                         
                         if (timeSinceLastAudio > AUDIO_END_TIMEOUT_MS) {
-                            // No new audio for a while, AI likely finished speaking
+                            // No new audio for a while, AI likely finished speaking.
+                            //
+                            // IMPORTANT: "no more writes" is NOT "finished playing".
+                            // AudioTrack.write() returns once bytes are buffered, so
+                            // several hundred ms of speech can still be queued in the
+                            // track and the A2DP pipeline. Reacquiring SCO here would
+                            // suspend A2DP and cut the tail off — "goodbye" came out
+                            // as "good". Wait for the hardware playback head to reach
+                            // everything we wrote before touching the route.
+                            waitForTrackToDrain()
+                            reacquireScoForListening()
                             isAIPlaying.set(false) // Resume mic capture
                             isPreBuffering = true // Reset for next turn
                             callbacks.onAudioPlaybackEnd()
@@ -1630,7 +2503,12 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
             applyGainToPcm16(shortBuffer, SOFTWARE_GAIN)
             
             // Use WRITE_BLOCKING to ensure all audio is written without dropping
-            audioTrack?.write(shortBuffer, 0, shortBuffer.size, AudioTrack.WRITE_BLOCKING)
+            val written = audioTrack?.write(
+                shortBuffer, 0, shortBuffer.size, AudioTrack.WRITE_BLOCKING
+            ) ?: 0
+            // Mono PCM16: one frame per sample. Tracked so waitForTrackToDrain() knows
+            // how far the playback head still has to travel.
+            if (written > 0) totalFramesWritten += written.toLong()
         } catch (e: Exception) {
             Log.e(TAG, "Error playing audio chunk", e)
         }
@@ -1658,8 +2536,12 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
                 // Session created/updated - setup is complete
                 "session.created", "session.updated" -> {
                     Log.d(TAG, "✅ Session configured: $eventType")
-                    isSetupComplete.set(true)
+                    val wasSetupComplete = isSetupComplete.getAndSet(true)
                     autoReconnects = 0
+                    if (!wasSetupComplete) {
+                        callbacks.onConnectionStatusChanged(true)
+                        flushPendingSpeakText()
+                    }
                     // Greet only once, on the initial session.created (session.updated
                     // can fire again later for config changes).
                     if (eventType == "session.created") maybeSendGreeting()
@@ -1676,6 +2558,7 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
                             audioQueue.clear()
                         }
                         audioTrack?.flush()
+                        totalFramesWritten = 0L // flush() zeroes the playback head too
                         isAIPlaying.set(false)
                         callbacks.onAudioPlaybackEnd()
                     }
@@ -1871,6 +2754,8 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
                 // Session reached a healthy state, so the reconnect budget is no
                 // longer needed for this connection.
                 autoReconnects = 0
+                callbacks.onConnectionStatusChanged(true)
+                flushPendingSpeakText()
                 maybeSendGreeting()
                 return
             }
@@ -1886,6 +2771,12 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
                 val inputText = inputTranscription?.get("text") as? String
                 if (!inputText.isNullOrEmpty()) {
                     currentInputTranscription.append(inputText)
+                    // NOTE: the processing chime is deliberately NOT triggered here.
+                    // inputTranscription arrives only after Gemini has received and
+                    // transcribed the turn, which is well into the silent gap the cue
+                    // is meant to cover. The local VAD in the capture loop
+                    // (detectSpeechEdge) fires it the moment the user stops talking,
+                    // which is as early as the signal exists.
                     callbacks.onTranscriptionUpdate(
                         currentInputTranscription.toString(),
                         currentOutputTranscription.toString(),
@@ -1918,6 +2809,7 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
                             val audioBase64 = inlineData["data"] as? String
                             if (audioBase64 != null) {
                                 if (!receivedAudioInCurrentTurn) {
+                                    Log.d(TAG, "🤖 GEMINI RESPONSE AUDIO RECEIVED")
                                     stopThinkingSound()
                                 }
                                 val audioData = Base64.decode(audioBase64, Base64.DEFAULT)
@@ -2116,9 +3008,25 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
             isAIPlaying.set(false)
             isMuted.set(false) // always clear mute on cleanup so next session starts unmuted
 
+            // Drop the song-ID window so we never fingerprint audio from a
+            // previous session, and don't hold ~380KB after teardown.
+            songIdBuffer = null
+
             // 🆕 Clear singleton instance
             instance = null
-            
+
+            // Release the thinking cue's SoundPool so its stream does not linger and
+            // hold the A2DP route open after the session ends.
+            try {
+                stopThinkingSound()
+                thinkingSoundPool?.release()
+                thinkingSoundPool = null
+                thinkingSoundId = 0
+                isThinkingSoundLoaded.set(false)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error releasing thinking SoundPool: ${e.message}")
+            }
+
             // Enhanced SCO cleanup using helper
             try {
                 scoHelper?.disconnectSco()
@@ -2133,12 +3041,20 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
             // the device stays in communication/telephony mode.
             try {
                 audioManager?.let { am ->
+                    // Hand the routing override back, or the phone stays pinned to
+                    // Bluetooth communication routing after the session ends.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        try { am.clearCommunicationDevice() } catch (e: Exception) {
+                            Log.w(TAG, "clearCommunicationDevice failed: ${e.message}")
+                        }
+                    }
                     if (am.isBluetoothScoOn) {
                         am.isBluetoothScoOn = false
                         am.stopBluetoothSco()
                     }
                     am.mode = AudioManager.MODE_NORMAL
                 }
+                scoHeldForListening.set(false) // next session re-acquires from scratch
                 Log.d(TAG, "🔄 Audio mode restored to NORMAL")
             } catch (e: Exception) {
                 Log.w(TAG, "Error restoring audio mode: ${e.message}")
@@ -2250,6 +3166,7 @@ EMAIL - SENDING (always confirm first): When the user asks you to email or write
         }
         try {
             audioTrack?.flush()
+            totalFramesWritten = 0L // flush() zeroes the playback head too
         } catch (e: Exception) {
             Log.w(TAG, "Error flushing audioTrack during interrupt: ${e.message}")
         }

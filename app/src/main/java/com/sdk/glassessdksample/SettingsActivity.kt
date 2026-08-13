@@ -153,8 +153,10 @@ class SettingsActivity : AppCompatActivity() {
     private fun setupSettings() {
         val prefs = getSharedPreferences("imi_prefs", MODE_PRIVATE)
 
-        // Continuous Chat toggle
-        binding.switchContinuousChat.isChecked = prefs.getBoolean("continuous_chat", true)
+        // Continuous Chat toggle. Defaults to OFF: a fresh install answers one
+        // question per "Hey Imi" and the user opts in to staying open, either
+        // here or by voice ("turn on conversation mode").
+        binding.switchContinuousChat.isChecked = prefs.getBoolean("continuous_chat", false)
         binding.switchContinuousChat.setOnCheckedChangeListener { _, isChecked ->
             prefs.edit().putBoolean("continuous_chat", isChecked).apply()
         }
@@ -270,8 +272,16 @@ class SettingsActivity : AppCompatActivity() {
         progressView: ProgressBar,
         remainingView: TextView
     ) {
-        callsView.text = "${usage.used} / ${usage.limit}"
-        progressView.progress = usage.progressPercent
-        remainingView.text = "Remaining : ${usage.remaining}"
+        if (usage.unlimited) {
+            // Free/unlimited feature: showing a limit or a countdown would be
+            // meaningless (and "Remaining : 2147483647" nonsensical).
+            callsView.text = "${usage.used} / ∞"
+            progressView.progress = 0
+            remainingView.text = "Unlimited"
+        } else {
+            callsView.text = "${usage.used} / ${usage.limit}"
+            progressView.progress = usage.progressPercent
+            remainingView.text = "Remaining : ${usage.remaining}"
+        }
     }
 }

@@ -308,6 +308,9 @@ class LiveGalleryActivity : AppCompatActivity() {
         wifiP2pHelper.registerReceiver()
         wifiP2pHelper.setCallback(p2pCallback)
 
+        // Widen the BLE pipe before any glasses media moves. See BleSpeedTuner.
+        com.sdk.glassessdksample.ui.BleSpeedTuner.tune(this, "LiveGallery")
+
         try {
             LargeDataHandler.getInstance().addOutDeviceListener(3, bleIpListener)
             Log.i(TAG, "BLE IP listener registered")

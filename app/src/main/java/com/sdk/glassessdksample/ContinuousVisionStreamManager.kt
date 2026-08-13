@@ -77,11 +77,12 @@ class ContinuousVisionStreamManager(
                 if (notifyType == 6 || notifyType == 89) {
                     Log.d(TAG, "📸 Received vision frame chunk (or stream): ${loadData.size} bytes")
 
-                    // Feed raw loadData to reassembler. We avoid trimming headers here because
-                    // some packets may not contain protocol prefixes — the reassembler will
-                    // search for JPEG SOI/EOI markers across the full buffer.
+                    // Route through acceptBigData, not processCleanData directly: it
+                    // strips the BC59 header/footer when present and passes raw JPEG
+                    // through untouched. Feeding headers into the reassembler leaves
+                    // protocol bytes embedded in the middle of the image.
                     try {
-                        onDataReceived(loadData)
+                        acceptBigData(loadData)
                     } catch (e: Exception) {
                         Log.e(TAG, "Error feeding data to reassembler: ${e.message}")
                     }
@@ -101,7 +102,7 @@ class ContinuousVisionStreamManager(
      * 3. Register BLE listener for frames
      * 4. Frames automatically delivered via BLE notifications
      */
-    fun startStreaming(onFrame: (ByteArray) -> Unit) {
+    fun startStreaming(context: android.content.Context, onFrame: (ByteArray) -> Unit) {
         if (isStreaming) {
             Log.w(TAG, "⚠️ Streaming already active")
             return
@@ -111,6 +112,11 @@ class ContinuousVisionStreamManager(
         onFrameReceived = onFrame
 
         Log.i(TAG, "🎥 Starting manual-loop vision streaming...")
+
+        // Widen the BLE pipe before frames start flowing. This path is the most
+        // sensitive to link speed in the whole app: it pulls frame after frame, so
+        // every round trip saved compounds across the session.
+        com.sdk.glassessdksample.ui.BleSpeedTuner.tune(context, "VisionStream")
 
         // Register BLE listener for vision frames (type 6)
         LargeDataHandler.getInstance().addOutDeviceListener(6, visionFrameListener)
@@ -413,27 +419,28 @@ class ContinuousVisionStreamManager(
                 return
             }
             
-            // 3. ✂️ UNIVERSAL STRIP: Remove Header (8 bytes) + Footer (2 bytes if packet large enough)
+            // 3. ✂️ Strip the 8-byte BC59 header.
+            //
+            // The trailing 2 bytes are NOT stripped. A CRC exists only on the final
+            // packet of a transfer, so removing 2 bytes from every chunk deletes real
+            // image data mid-stream and corrupts the JPEG. Any trailing CRC lands
+            // after the EOI marker and is discarded by the reassembler anyway.
             val headerSize = 8
-            val footerSize = if (data.size > 12) 2 else 0  // Small packets may not have footer
-            
-            if (data.size > headerSize) {
-                val payloadSize = data.size - headerSize - footerSize
-                
-                if (payloadSize > 0) {
-                    val cleanData = ByteArray(payloadSize)
-                    System.arraycopy(data, headerSize, cleanData, 0, payloadSize)
-                    
-                    // Log first few bytes of clean data to hunt for FF D8
-                    if (packetCount < 30) {
-                        val cleanHex = cleanData.take(8.coerceAtMost(cleanData.size)).joinToString(" ") { 
-                            String.format("%02X", it) 
-                        }
-                        Log.d(TAG, "✂️ CLEAN [${cleanData.size}b]: $cleanHex")
+            val payloadSize = data.size - headerSize
+
+            if (payloadSize > 0) {
+                val cleanData = ByteArray(payloadSize)
+                System.arraycopy(data, headerSize, cleanData, 0, payloadSize)
+
+                // Log first few bytes of clean data to hunt for FF D8
+                if (packetCount < 30) {
+                    val cleanHex = cleanData.take(8.coerceAtMost(cleanData.size)).joinToString(" ") {
+                        String.format("%02X", it)
                     }
-                    
-                    processCleanData(cleanData)
+                    Log.d(TAG, "✂️ CLEAN [${cleanData.size}b]: $cleanHex")
                 }
+
+                processCleanData(cleanData)
             }
             
         } catch (e: Exception) {
@@ -450,91 +457,55 @@ class ContinuousVisionStreamManager(
      */
     private fun processCleanData(data: ByteArray) {
         try {
-            // 🔍 HUNT for FF D8 (SOI - Start Of Image) ANYWHERE in the data
-            val soiPos = findMarker(data, 0xFF.toByte(), 0xD8.toByte())
-            
-            if (soiPos >= 0) {
-                // Found SOI! Drop any garbage before it, start fresh
-                if (imageBuffer.size() > 0) {
-                    Log.w(TAG, "⚠️ Dropping incomplete frame: ${imageBuffer.size()} bytes")
-                }
+            if (!isCollectingFrame) {
+                // Not collecting yet: look for the start of an image. Anything before
+                // the SOI is inter-frame padding and is discarded.
+                val soiPos = findMarker(data, 0xFF.toByte(), 0xD8.toByte())
+                if (soiPos < 0) return
+
                 imageBuffer.reset()
-                
-                // Write from SOI position onwards
                 imageBuffer.write(data, soiPos, data.size - soiPos)
-                Log.i(TAG, "📸 SOI Found at pos $soiPos! Collecting frame...")
                 isCollectingFrame = true
-            } else if (isCollectingFrame) {
-                // No SOI in this chunk, but we're collecting - add to buffer
+                Log.i(TAG, "📸 SOI found at $soiPos — collecting frame")
+            } else {
+                // Already collecting: append blindly.
+                //
+                // Do NOT scan for SOI here. FF D8 occurs freely inside JPEG
+                // entropy-coded data, so treating every occurrence as a new frame
+                // resets the buffer mid-image and no frame ever completes. Only the
+                // EOI scan below may end a frame.
                 imageBuffer.write(data)
             }
-            
-            // Now check buffer for complete JPEG (has both SOI and EOI)
-            if (isCollectingFrame && imageBuffer.size() > 10) {
-                val buffer = imageBuffer.toByteArray()
-                val bufLen = buffer.size
-                
-                // Check if buffer ends with FF D9 (EOI)
-                if (buffer[bufLen - 2] == 0xFF.toByte() && buffer[bufLen - 1] == 0xD9.toByte()) {
-                    // Verify buffer starts with FF D8
-                    if (buffer[0] == 0xFF.toByte() && buffer[1] == 0xD8.toByte()) {
-                        Log.i(TAG, "✅ EOI Found! Complete JPEG: $bufLen bytes")
-                        deliverFrame(buffer)
-                    } else {
-                        Log.w(TAG, "⚠️ EOI found but no SOI at start, hunting...")
-                        // Find SOI in buffer
-                        val soiInBuffer = findMarker(buffer, 0xFF.toByte(), 0xD8.toByte())
-                        if (soiInBuffer >= 0) {
-                            val jpegData = buffer.copyOfRange(soiInBuffer, bufLen)
-                            Log.i(TAG, "✅ Found valid JPEG in buffer: ${jpegData.size} bytes")
-                            deliverFrame(jpegData)
-                        }
-                    }
-                    imageBuffer.reset()
-                    isCollectingFrame = false
+
+            // Scan for EOI, but only past the SOI we already have. Searching from 0
+            // could match an FF D9 byte pair inside the JPEG header segments.
+            val buffer = imageBuffer.toByteArray()
+            val eoiPos = findMarker(buffer, 0xFF.toByte(), 0xD9.toByte(), fromIndex = 2)
+            if (eoiPos >= 2) {
+                val jpegEnd = eoiPos + 2
+                val jpegData = buffer.copyOfRange(0, jpegEnd)
+                Log.i(TAG, "✅ EOI at $eoiPos — complete JPEG: ${jpegData.size} bytes")
+
+                imageBuffer.reset()
+                isCollectingFrame = false
+
+                // Carry over anything after this image; the next frame may already
+                // have started inside the same chunk.
+                if (buffer.size > jpegEnd) {
+                    processCleanData(buffer.copyOfRange(jpegEnd, buffer.size))
                 }
-                
-                // Also scan buffer for EOI anywhere (might not be at end)
-                val eoiPos = findMarker(buffer, 0xFF.toByte(), 0xD9.toByte())
-                if (eoiPos > 2) {
-                    // Found EOI somewhere in buffer
-                    val soiInBuffer = findMarker(buffer, 0xFF.toByte(), 0xD8.toByte())
-                    if (soiInBuffer >= 0 && soiInBuffer < eoiPos) {
-                        val jpegEnd = eoiPos + 2
-                        val jpegData = buffer.copyOfRange(soiInBuffer, jpegEnd)
-                        Log.i(TAG, "✅ JPEG found mid-buffer: ${jpegData.size} bytes (SOI@$soiInBuffer, EOI@$eoiPos)")
-                        deliverFrame(jpegData)
-                        
-                        // Keep leftover data after this JPEG
-                        imageBuffer.reset()
-                        if (buffer.size > jpegEnd) {
-                            val leftover = buffer.copyOfRange(jpegEnd, buffer.size)
-                            imageBuffer.write(leftover)
-                            // Check if leftover starts with new SOI
-                            if (leftover.size >= 2 && leftover[0] == 0xFF.toByte() && leftover[1] == 0xD8.toByte()) {
-                                Log.d(TAG, "📸 New SOI in leftover! Continuing collection...")
-                            } else {
-                                isCollectingFrame = false
-                            }
-                        } else {
-                            isCollectingFrame = false
-                        }
-                    }
-                }
-                
-                // Log collection progress periodically
-                if (imageBuffer.size() % 5000 < 100) {
-                    Log.d(TAG, "📊 Collecting: ${imageBuffer.size()} bytes")
-                }
+
+                deliverFrame(jpegData)
+                return
             }
-            
+
             // Overflow protection
             if (imageBuffer.size() > 500_000) {
-                Log.w(TAG, "⚠️ Buffer overflow (>500KB), clearing")
+                Log.w(TAG, "⚠️ Buffer overflow (>500KB) with no EOI — clearing")
                 imageBuffer.reset()
                 isCollectingFrame = false
             }
-            
+
         } catch (e: Exception) {
             Log.e(TAG, "processCleanData error: ${e.message}")
             imageBuffer.reset()
@@ -543,10 +514,10 @@ class ContinuousVisionStreamManager(
     }
     
     /**
-     * Find 2-byte marker in data, return position or -1
+     * Find 2-byte marker in data at or after [fromIndex], return position or -1.
      */
-    private fun findMarker(data: ByteArray, b1: Byte, b2: Byte): Int {
-        for (i in 0 until data.size - 1) {
+    private fun findMarker(data: ByteArray, b1: Byte, b2: Byte, fromIndex: Int = 0): Int {
+        for (i in maxOf(0, fromIndex) until data.size - 1) {
             if (data[i] == b1 && data[i + 1] == b2) {
                 return i
             }

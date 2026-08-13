@@ -5,6 +5,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
 import android.content.Context
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaPlayer
@@ -67,7 +68,7 @@ class HeyImiWakeWordDetector(
         // (phone/headset-mic settings). Do not diverge from these without also
         // changing iOS, or the two apps will behave differently.
         const val DEFAULT_THRESHOLD = 0.55f        // sustained EMA fire level
-        private const val DEFAULT_PEAK_TRIGGER = 0.85f // single raw frame -> fire now
+        const val DEFAULT_PEAK_TRIGGER = 0.85f     // single raw frame -> fire now
         private const val DEFAULT_SMOOTHING = 2     // 2/(2+1) => emaAlpha 0.667
         private const val DEFAULT_CONSEC = 2        // frames above threshold to fire
         private const val DEFAULT_COOLDOWN_MS = 2_000L
@@ -146,6 +147,23 @@ class HeyImiWakeWordDetector(
 
     fun getThreshold(): Float = threshold
 
+    /**
+     * Raise/lower the single-frame instant-fire level.
+     *
+     * Mark 2's microphone is markedly more sensitive than Mark 1's, and on it the
+     * model scores 0.93-0.97 on ordinary conversation that does not contain the
+     * wake phrase — comfortably over the 0.85 default, so every one of those fires
+     * immediately via the peak path without the EMA/consec gate ever being
+     * consulted. Note this cannot be fixed by [setThreshold]: that governs a
+     * different gate which these detections never reach.
+     */
+    fun setPeakTrigger(value: Float) {
+        peakTrigger = value.coerceIn(0.05f, 1.0f)
+        Log.d(TAG, "Peak trigger set: peakTrigger=$peakTrigger")
+    }
+
+    fun getPeakTrigger(): Float = peakTrigger
+
     fun start() {
         if (isListening) return
         if (session == null || ortEnv == null) {
@@ -181,6 +199,7 @@ class HeyImiWakeWordDetector(
                 "Wake config: threshold=$threshold peakTrigger=$peakTrigger smoothing=$smoothing consec=$consec cooldownMs=$cooldownMs energyGate=$energyGate emaAlpha=$emaAlpha"
             )
             Log.i(TAG, "Wake-word listening started (source=${audioSourceName(activeAudioSource)})")
+            logRoutedInputDevice()
         } catch (e: SecurityException) {
             Log.e(TAG, "RECORD_AUDIO missing", e)
         } catch (e: Exception) {
@@ -219,16 +238,7 @@ class HeyImiWakeWordDetector(
     fun isListening(): Boolean = isListening
 
     fun playChimeSound() {
-        try {
-            chimePlayer?.let { p ->
-                if (p.isPlaying) p.seekTo(0) else p.start()
-            } ?: run {
-                android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 100)
-                    .startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 200)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Chime play failed: ${e.message}")
-        }
+        WakeChime.play(chimePlayer, TAG)
     }
 
     fun processExternalAudio(pcmData: ByteArray) {
@@ -660,6 +670,36 @@ class HeyImiWakeWordDetector(
         return null
     }
 
+    /**
+     * Log the microphone the system ACTUALLY gave us, not the one we asked for.
+     *
+     * [activeAudioSource] is only the requested AudioSource constant — it always
+     * prints "MIC" even when the frames are really arriving from the glasses over
+     * Bluetooth SCO, which happens whenever the device is left in
+     * MODE_IN_COMMUNICATION with SCO on by a finished conversation. iOS runs its
+     * wake detector on the phone mic (AudioSessionManager.activateForVoiceLoop,
+     * which pins input to the glasses, is called only for conversations), so the
+     * routed device is the one thing that has to match for parity.
+     */
+    private fun logRoutedInputDevice() {
+        try {
+            val device = audioRecorder?.routedDevice
+            if (device == null) {
+                Log.i(TAG, "🎙️ Wake mic route: UNKNOWN (routedDevice null)")
+                return
+            }
+            val kind = when (device.type) {
+                AudioDeviceInfo.TYPE_BUILTIN_MIC -> "PHONE MIC (matches iOS)"
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "BLUETOOTH SCO / GLASSES (diverges from iOS)"
+                AudioDeviceInfo.TYPE_WIRED_HEADSET -> "WIRED HEADSET"
+                else -> "type=${device.type}"
+            }
+            Log.i(TAG, "🎙️ Wake mic route: $kind — ${device.productName}")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not read routed input device: ${e.message}")
+        }
+    }
+
     private fun audioSourceName(source: Int): String {
         return when (source) {
             MediaRecorder.AudioSource.MIC -> "MIC"
@@ -669,26 +709,7 @@ class HeyImiWakeWordDetector(
     }
 
     private fun preloadChimeSound() {
-        try {
-            val chimeResId = context.resources.getIdentifier("chime", "raw", context.packageName)
-            if (chimeResId != 0) {
-                chimePlayer = MediaPlayer.create(context, chimeResId)?.apply { setVolume(1f, 1f) }
-                return
-            }
-
-            try {
-                val afd = context.assets.openFd("sounds/chime.mp3")
-                chimePlayer = MediaPlayer().apply {
-                    setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-                    prepare()
-                    setVolume(1f, 1f)
-                }
-                afd.close()
-            } catch (_: Exception) {
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Chime preload failed: ${e.message}")
-        }
+        chimePlayer = WakeChime.createPlayer(context)
     }
 
     private fun loadModelFromAssets(assetPath: String): ByteArray {

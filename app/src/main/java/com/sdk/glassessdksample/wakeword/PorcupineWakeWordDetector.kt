@@ -136,17 +136,7 @@ class PorcupineWakeWordDetector(
 
     /** Play wake-acknowledgment chime. */
     fun playChimeSound() {
-        try {
-            chimePlayer?.let { p ->
-                if (p.isPlaying) p.seekTo(0) else p.start()
-            } ?: run {
-                android.media.ToneGenerator(
-                    android.media.AudioManager.STREAM_NOTIFICATION, 100
-                ).startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 200)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Chime error: ${e.message}")
-        }
+        WakeChime.play(chimePlayer, TAG)
     }
 
     /**
@@ -186,25 +176,6 @@ class PorcupineWakeWordDetector(
     }
 
     private fun preloadChime() {
-        try {
-            val resId = context.resources.getIdentifier("chime", "raw", context.packageName)
-            if (resId != 0) {
-                chimePlayer = MediaPlayer.create(context, resId)?.apply { setVolume(1f, 1f) }
-                Log.d(TAG, "Chime pre-loaded from resources")
-                return
-            }
-            try {
-                val afd = context.assets.openFd("sounds/chime.mp3")
-                chimePlayer = MediaPlayer().apply {
-                    setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-                    prepare()
-                    setVolume(1f, 1f)
-                }
-                afd.close()
-                Log.d(TAG, "Chime pre-loaded from assets/sounds/chime.mp3")
-            } catch (_: Exception) { /* fall back to ToneGenerator beep */ }
-        } catch (e: Exception) {
-            Log.w(TAG, "Chime preload failed: ${e.message}")
-        }
+        chimePlayer = WakeChime.createPlayer(context)
     }
 }

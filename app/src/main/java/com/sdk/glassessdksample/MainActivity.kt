@@ -109,7 +109,39 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var isListening = false
     private var isInConversationMode = false
     private var isGeminiLiveMode = false // Track if using Gemini Live bidirectional audio
+
+    /**
+     * Latched for the whole lifetime of a Gemini Live session, from the first start
+     * attempt until the session is torn down.
+     *
+     * isGeminiLiveMode is set only AFTER the slow start path has run, so it is still
+     * false when a duplicate trigger arrives milliseconds later and cannot prevent a
+     * second session. This flag is set synchronously at the entry point instead.
+     */
+    @Volatile private var isGeminiSessionStarting = false
+
+    /** True when the app is running against Mark 2 glasses. */
+    private fun isMark2Device(): Boolean =
+        com.sdk.glassessdksample.ui.DevicePreferenceManager.getDeviceType(this) ==
+            com.sdk.glassessdksample.ui.DeviceType.MARK2
     private var aiIsPlaying = false // true when AI audio playback is active; used to prevent interrupts
+    // Set when Continuous Chat is OFF and the AI has just answered a real user
+    // turn: the session closes as soon as that reply finishes playing, so the app
+    // falls back to waiting for "Hey Imi" instead of staying open for more turns.
+    private var endSessionAfterPlayback = false
+    // Safety net for the above. onAudioPlaybackEnd() is driven by an audio-queue
+    // idle timeout and is also fired by the interrupt paths, so it cannot be
+    // relied on as the ONLY way to close the session — if it never arrives the
+    // conversation would stay open and Continuous Chat=off would look broken.
+    // This posted task force-stops the session shortly after the turn ends;
+    // whichever path runs first cancels the other.
+    private var endSessionFallback: Runnable? = null
+    // True once a conversation-mode voice command has been acted on for the
+    // current utterance. The live transcript arrives in growing chunks, so
+    // without this the command would fire on every chunk. Cleared on turn end.
+    private var conversationModeCommandHandled = false
+    // Guards startGeminiNow() so the chime-parallel start fires once per wake-up.
+    private var geminiStartRequested = false
     private var isInterruptEnabled = false // Interrupt mode: when enabled, user voice stops AI immediately
     private var isAiMuted = false // Mute mode: when enabled, AI won't listen to any commands
     private var lastCapturedPhoto: ByteArray? = null // Store last photo for object detection
@@ -120,6 +152,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var singleCaptureFrameReceived = false // Guards against extra frames while CoV mode is still winding down
     private var captureCooldownUntilMs = 0L // Ignore stray frames arriving after a single capture finished
     private var lastSavedPhotoFile: File? = null
+    /** Public URL of the most recent photo uploaded to the backend; null until one succeeds. */
+    private var lastUploadedImageUrl: String? = null
     private var glassBatteryLevel: Int? = null // Store glass battery percentage
     private var isWaitingForVisionPhoto = false // Flag to auto-analyze next photo
     private var lastVisionRequestType: String? = null // "person" | "general"
@@ -281,10 +315,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // Initialize WiFi P2P Live Camera for fast image streaming
         initWifiP2PLiveCamera()
         
-        // Image upload feature temporarily disabled (removed per request)
-        val uploadUrl = prefs.getString("image_upload_url", "http://10.0.2.2:8080/upload") ?: "http://10.0.2.2:8080/upload"
+        // Image uploads now go through ImageUploadSync -> the IMI Glass backend
+        // (/v1/upload/image), which authenticates via the logged-in session. The
+        // old self-hosted ImageUploadService/upload-URL setting is retired.
         imageUploadService = null
-        
+
         // Initialize News API Service (get free key from newsapi.org)
         val newsApiKey = prefs.getString("news_api_key", "") ?: ""
         newsApiService = NewsApiService(newsApiKey)
@@ -485,6 +520,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return
         }
 
+        // 🆕 A vision capture/analysis is in flight. Starting the detector now
+        // would let a wake word (or any loud speech) tear down the session that
+        // is about to speak the answer. See MainActivity.visionBusy.
+        if (visionBusy) {
+            Log.d(TAG, "👁️ Wake model not started ($trigger): vision analysis in progress")
+            return
+        }
+
         if (isAiMuted) {
             Log.d(TAG, "🔇 Wake model not started ($trigger): AI is muted")
             return
@@ -522,6 +565,51 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to stop wake model ($reason): ${e.message}")
         }
+    }
+
+    /** Backstop that releases vision suppression if the flow never completes. */
+    private var visionBusyTimeoutRunnable: Runnable? = null
+
+    /**
+     * 🆕 Engage the vision window: wake-word detection stays OFF from here until
+     * [clearVisionBusy]. Covers photo capture → WiFi download → AI analysis →
+     * spoken answer, which can run 20s+ on a large photo.
+     */
+    private fun setVisionBusy(reason: String) {
+        visionBusy = true
+        try {
+            HotHelper.getInstance(this).setSuppressed(true)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to suppress wake model ($reason): ${e.message}")
+        }
+        Log.i(TAG, "👁️ Vision busy ENGAGED ($reason) - wake word detection off")
+
+        // Safety net: never let a stalled/crashed vision flow leave the assistant
+        // permanently deaf to "Hey Imi".
+        visionBusyTimeoutRunnable?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        visionBusyTimeoutRunnable = Runnable {
+            Log.w(TAG, "⏱️ Vision busy timed out - releasing wake word suppression")
+            clearVisionBusy("timeout")
+        }
+        Handler(Looper.getMainLooper()).postDelayed(visionBusyTimeoutRunnable!!, VISION_BUSY_TIMEOUT_MS)
+    }
+
+    /**
+     * 🆕 Release the vision window and re-arm wake detection (subject to the
+     * normal guards - it won't start while muted or mid-conversation).
+     */
+    private fun clearVisionBusy(reason: String) {
+        if (!visionBusy) return
+        visionBusy = false
+        visionBusyTimeoutRunnable?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        visionBusyTimeoutRunnable = null
+        try {
+            HotHelper.getInstance(this).setSuppressed(false)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to release wake suppression ($reason): ${e.message}")
+        }
+        Log.i(TAG, "👁️ Vision busy RELEASED ($reason)")
+        startWakeWordDetectorIfReady("vision-complete-$reason")
     }
     
     /**
@@ -599,26 +687,86 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
     
     /**
+     * 🆕 Vision text waiting to be spoken once a freshly (re)started Gemini Live
+     * session actually finishes connecting. Only used by the dead-socket fallback
+     * in startGeminiLiveWithVisionResult() below.
+     */
+    private var pendingVisionTextToSpeak: String? = null
+
+    /** Timeout that abandons [pendingVisionTextToSpeak] if no session ever comes up. */
+    private var pendingVisionGiveUp: Runnable? = null
+
+    private fun scheduleVisionGiveUp() {
+        cancelPendingVisionGiveUp()
+        val runnable = Runnable {
+            pendingVisionGiveUp = null
+            if (pendingVisionTextToSpeak != null) {
+                Log.w(TAG, "⏱️ Gemini Live never came back - dropping pending vision result")
+                pendingVisionTextToSpeak = null
+                notifyVisionResultSpoken()
+            }
+        }
+        pendingVisionGiveUp = runnable
+        Handler(Looper.getMainLooper()).postDelayed(runnable, VISION_SPEAK_GIVE_UP_MS)
+    }
+
+    private fun cancelPendingVisionGiveUp() {
+        pendingVisionGiveUp?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        pendingVisionGiveUp = null
+    }
+
+    /**
      * 🆕 Start Gemini Live with a vision result to speak immediately
      * The AI will naturally speak the vision analysis in its own voice
-     * 🆕 NOW: Just unmutes Gemini Live (kept active) and injects vision text
+     * 🆕 Unmutes + speaks on the existing session when it's actually connected.
+     * If the session had already died (e.g. it was torn down while VisionChat was
+     * analyzing the photo), speakText() would silently fail against a closed
+     * websocket — so in that case, start a fresh session and queue the vision
+     * text to be spoken once it finishes connecting instead of losing it.
      */
     private fun startGeminiLiveWithVisionResult(visionText: String) {
         try {
-            // 🔊 UNMUTE Gemini Live - it was kept active but muted during vision processing
-            geminiLiveService?.unmuteOutput()
-            Log.d(TAG, "🔊 Gemini Live unmuted - ready to speak vision result")
-            
-            // Inject the vision text for Gemini to speak naturally
-            geminiLiveService?.speakText(visionText, speakDirectly = true)
-            Log.i(TAG, "🎙️ Vision result sent to Gemini Live for speaking")
-            
-            updateConversation("System", "🎧 Speaking vision result...")
-            
+            if (geminiLiveService != null && GeminiLiveService.isActive()) {
+                // 🔊 UNMUTE Gemini Live - it was kept active but muted during vision processing
+                geminiLiveService?.unmuteOutput()
+                Log.d(TAG, "🔊 Gemini Live unmuted - ready to speak vision result")
+
+                // Inject the vision text for Gemini to speak naturally
+                geminiLiveService?.speakText(visionText, speakDirectly = true)
+                Log.i(TAG, "🎙️ Vision result sent to Gemini Live for speaking")
+
+                updateConversation("System", "🎧 Speaking vision result...")
+                notifyVisionResultSpoken()
+            } else {
+                // Session is gone - reconnect first, then speak once connected
+                Log.w(TAG, "🔄 Gemini Live session not active - reconnecting before speaking vision result")
+                pendingVisionTextToSpeak = visionText
+                proceedWithGeminiLive()
+            }
+
         } catch (e: Exception) {
             Log.e(TAG, "Failed to speak vision result: ${e.message}", e)
             Toast.makeText(this@MainActivity, "Failed to speak: ${e.message}", Toast.LENGTH_SHORT).show()
+            // Even on failure, let VisionChatActivity know we're done trying so it
+            // doesn't sit waiting for the full timeout.
+            notifyVisionResultSpoken()
         }
+    }
+
+    /**
+     * 🆕 Tell VisionChatActivity (if it's still open, waiting to finish) that we're
+     * done attempting to speak the vision result - either it's actually playing now,
+     * or we gave up. VisionChatActivity closes on this signal instead of a fixed
+     * timer, so it never disappears before the summary was actually spoken.
+     */
+    private fun notifyVisionResultSpoken() {
+        androidx.localbroadcastmanager.content.LocalBroadcastManager
+            .getInstance(this)
+            .sendBroadcast(Intent(VisionChatActivity.ACTION_VISION_RESULT_SPOKEN))
+
+        // 🆕 The answer is being spoken (or we've given up) - the vision window is
+        // over, so wake word detection can come back.
+        clearVisionBusy("vision-result-spoken")
     }
 
     override fun onStart() {
@@ -634,7 +782,73 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             EventBus.getDefault().unregister(this)
         }
 
-        // Disabled for Play policy compliance: avoid background foreground-service usage.
+        // Screen off / minimised / locked: hand wake-word listening over to the
+        // foreground ListeningService before this Activity goes away. Without this
+        // the detector died with the Activity and "Hey IMI" did nothing until the
+        // user unlocked the phone and reopened the app.
+        //
+        // This mirrors Mark1MainActivity. The service declares
+        // foregroundServiceType="microphone" and posts an ongoing notification, which
+        // is the pattern Play requires for an always-listening assistant.
+        // 👁️ ...unless we are being stopped because WE launched VisionChatActivity
+        // over the top. That is not a minimise or a screen-off, which is the only
+        // case this hand-off exists for.
+        //
+        // Handing off during vision is actively harmful: it flips HotHelper to the
+        // PHONE mic (setPreferGlassBleAudio(false)) and starts ListeningService,
+        // arming a second recorder against the MODE_IN_COMMUNICATION session that
+        // Gemini Live is holding for SCO-in / A2DP-out. That re-route silences the
+        // live session — so the vision description came back and was handed to
+        // speakText(), but never actually made a sound.
+        //
+        // Nothing is lost by skipping: onResume() puts the detector back on glass
+        // BLE audio, and clearVisionBusy() re-arms it when the answer is spoken.
+        if (visionBusy || visionChatOpenFlag) {
+            Log.i(TAG, "👁️ Vision in flight - skipping ListeningService hand-off to keep the live audio route intact")
+            return
+        }
+
+        handOffListeningToService()
+    }
+
+    /**
+     * Starts the foreground ListeningService so wake-word detection survives this
+     * Activity being stopped (screen off, locked, or minimised).
+     *
+     * Mark 2 feeds the detector from glass BLE audio via initGlassWifiListener(),
+     * and that feed belongs to this Activity — so it stops when we do. We therefore
+     * switch HotHelper back to phone-mic capture on the way out, which the service
+     * can keep running on its own, and switch back to BLE audio in onResume().
+     */
+    private fun handOffListeningToService() {
+        if (!backgroundListeningEnabled || isAiMuted) {
+            Log.d(TAG, "🎙️ Not handing off to ListeningService (enabled=$backgroundListeningEnabled muted=$isAiMuted)")
+            return
+        }
+        if (!hasRecordAudioPermission()) {
+            Log.w(TAG, "🎤 Not handing off to ListeningService — RECORD_AUDIO not granted")
+            return
+        }
+
+        try {
+            // The Activity's BLE PCM feed is about to stop, so the service must
+            // capture from the phone mic itself. Restart the detector under the new
+            // source: HotHelper.start() is a no-op while it still thinks it is running.
+            HotHelper.getInstance(applicationContext).apply {
+                stop()
+                setPreferGlassBleAudio(false)
+            }
+
+            val serviceIntent = Intent(this, ListeningService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+            Log.d(TAG, "🎙️ Wake-word listening handed off to ListeningService (screen off / minimised)")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not hand off to ListeningService: ${e.message}")
+        }
     }
 
     /**
@@ -661,6 +875,36 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onResume() {
         super.onResume()
+
+        // Seamless hand-back: if a conversation started while the phone was locked
+        // is still running, turning the screen on must NOT tear it down. Tell the
+        // service to release the session and let the in-app flow take over the mic.
+        // (Mirrors Mark1MainActivity.checkBleAndShowGate.)
+        if (ListeningService.isBackgroundConversationActive()) {
+            Log.i(TAG, "🔗 Background conversation in progress — taking it over in-app")
+            try {
+                startService(
+                    Intent(this, ListeningService::class.java)
+                        .apply { action = ListeningService.ACTION_STOP_BG_CONVERSATION }
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not stop background conversation: ${e.message}")
+            }
+        }
+
+        // We're visible again, so this Activity's glass BLE feed is live once more —
+        // switch the detector back to BLE audio (onStop had flipped it to phone mic).
+        if (backgroundListeningEnabled && !isAiMuted && hasRecordAudioPermission()) {
+            try {
+                HotHelper.getInstance(applicationContext).apply {
+                    stop()
+                    setPreferGlassBleAudio(true)
+                }
+                startWakeWordDetectorIfReady("activity-resumed")
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not restore in-app wake detection: ${e.message}")
+            }
+        }
 
         // Re-bind to the background service if we lost the connection
         // (e.g. Activity was recreated after screen-off / config change).
@@ -1118,7 +1362,37 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      * Attempt to start SCO (glass mic) before launching Gemini Live conversation.
      * If SCO connects within timeout, use glass mic; otherwise fall back to phone mic.
      */
-    private fun startGeminiAfterSco(timeoutMs: Long = 1500L) {
+    /**
+     * Kick off the Gemini Live connection for the CURRENT wake-up, exactly once.
+     *
+     * The wake chime and the connection now run in parallel, and several chime
+     * branches can reach this point, so the guard makes a double-start
+     * impossible — two overlapping sessions would fight over the mic.
+     * Reset in stopGeminiLiveConversation() for the next wake word.
+     */
+    private fun startGeminiNow() {
+        if (geminiStartRequested) {
+            Log.d(TAG, "⏭️ Gemini start already requested for this wake-up — ignoring duplicate")
+            return
+        }
+        geminiStartRequested = true
+        try {
+            startGeminiAfterSco()
+        } catch (e: Exception) {
+            geminiStartRequested = false
+            Log.e(TAG, "Failed to start Gemini Live: ${e.message}")
+        }
+    }
+
+    /**
+     * @param timeoutMs how long to wait for SCO before starting anyway. This wait
+     *   is on the critical path between the wake chime and the mic opening, and
+     *   GeminiLiveService performs its own SCO wait immediately afterwards, so a
+     *   long value here is largely duplicated delay the user hears as lag. Kept
+     *   short: if HFP is going to connect it usually does so well within this,
+     *   and if it isn't, we fall back to the phone mic either way.
+     */
+    private fun startGeminiAfterSco(timeoutMs: Long = 600L) {
         mainScope.launch {
             val helper = scoHelper ?: ScoConnectionHelper(this@MainActivity).also { scoHelper = it }
             Log.d(TAG, "🔔 Trying SCO before starting Gemini Live (timeout=${timeoutMs}ms)")
@@ -1418,6 +1692,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      * Actually start Gemini Live (called after connection check)
      */
     private fun proceedWithGeminiLive() {
+        // MARK 2: refuse to start a second session on top of a live one.
+        //
+        // A single wake word reaches here TWICE — once from the in-app handler and
+        // once from ListeningService via onNewIntent — a few milliseconds apart.
+        // Both passes used to build a full session: two AudioRecords, two
+        // AudioTracks and two WebSockets, all fighting over one Bluetooth device.
+        // The first pass would grab the phone mic (SCO not up yet) while the second
+        // got the glasses, and their AudioTracks invalidated each other mid-reply
+        // ("dead IAudioTrack", "releaseBuffer ... > mUnreleased"), which is why the
+        // reply cut out and the thinking cue was torn down under a live session.
+        if (isMark2Device() && isGeminiSessionStarting) {
+            Log.d(TAG, "↩️ Gemini Live session already starting — ignoring duplicate trigger")
+            return
+        }
+        if (isMark2Device()) isGeminiSessionStarting = true
+
         Log.d(TAG, "🎙️ Starting Gemini Live with dual connection...")
 
         // Enable glass headset mode (prefer the full SCO-enabled helper)
@@ -1472,6 +1762,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             $runtimeContext
         """.trimIndent()
 
+        // 🔂 Greet only in Continuous Chat mode. With Continuous Chat OFF the
+        // session ends after ONE reply, so a spoken "Hi, how can I help?" would
+        // burn that single reply before the user has even asked anything — and
+        // it delays the answer. Single-reply mode therefore stays silent after
+        // the wake chime and answers the user's question directly.
+        val greetOnWake = prefs.getBoolean("continuous_chat", CONTINUOUS_CHAT_DEFAULT)
+
         // Wait for SCO to be active and stable before starting the live conversation.
         mainScope.launch(Dispatchers.Main) {
             try {
@@ -1485,17 +1782,25 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
 
                 try {
-                    geminiLiveService?.startLiveConversation(systemInstruction, greetOnStart = true)
+                    geminiLiveService?.startLiveConversation(systemInstruction, greetOnStart = greetOnWake)
                     updateConversation("System", "🎧 Glass Mic Active - Speak naturally!")
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to start Gemini Live after SCO wait: ${e.message}")
+                    // Startup failed, so no session exists — drop the latch or the
+                    // next wake word would be refused as a "duplicate" forever.
+                    isGeminiSessionStarting = false
+                    geminiStartRequested = false
                     Toast.makeText(this@MainActivity, "Failed to start Gemini Live: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error waiting for SCO before Gemini Live: ${e.message}")
                 try {
-                    geminiLiveService?.startLiveConversation(systemInstruction, greetOnStart = true)
-                } catch (ex: Exception) { Log.e(TAG, "Fallback startGeminiLive failed: ${ex.message}") }
+                    geminiLiveService?.startLiveConversation(systemInstruction, greetOnStart = greetOnWake)
+                } catch (ex: Exception) {
+                    Log.e(TAG, "Fallback startGeminiLive failed: ${ex.message}")
+                    isGeminiSessionStarting = false
+                    geminiStartRequested = false
+                }
             }
         }
     }
@@ -2185,7 +2490,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         speakOut("I am currently muted. Please unmute me first.", "MUTED")
                         return
                     }
-                    
+
+                    // 🆕 A wake word already in flight when vision started would
+                    // otherwise open a NEW Gemini Live session here, tearing down
+                    // the muted one that is about to speak the vision answer.
+                    if (visionBusy) {
+                        Log.d(TAG, "👁️ Ignoring wake word: vision analysis in progress")
+                        return
+                    }
+
                     stopWakeWordDetector("wake-word-triggered")
                     
                     // 🎤 ALWAYS use Gemini Live API (REST API disabled)
@@ -2194,69 +2507,39 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     isInConversationMode = true
                     updateConversation("System", "Hey Imi detected! Starting Gemini Live...")
                     
-                    // Try common device Download paths and res/raw resource, else fallback to beeps
+                    // Wake chime ships as res/raw/wake_chime.wav. The old code also
+                    // scanned Download/ for a side-loaded bmw_warning_chime.mp3, which
+                    // silently took priority over the packaged sound; that lookup is
+                    // gone so the bundled chime is the only wake sound.
                     try {
-                        val candidates = listOf(
-                            File("/sdcard/Download/bmw_warning_chime.mp3"),
-                            File("/storage/emulated/0/Download/bmw_warning_chime.mp3"),
-                            File(Environment.getExternalStorageDirectory(), "Download/bmw_warning_chime.mp3"),
-                            File(filesDir, "bmw_warning_chime.mp3")
-                        )
-
                         var played = false
-                        for (candidate in candidates) {
-                            if (candidate.exists() && candidate.canRead()) {
-                                Log.d(TAG, "Playing wake chime from device path: ${candidate.absolutePath}")
-                                val mp = MediaPlayer()
-                                try {
-                                    mp.setDataSource(candidate.absolutePath)
-                                    // Use music stream for higher audible volume and set max volume
-                                    mp.setAudioStreamType(AudioManager.STREAM_MUSIC)
-                                    mp.prepare()
-                                    try { mp.setVolume(1.0f, 1.0f) } catch (_: Exception) {}
-                                    mp.start()
-                                    mp.setOnCompletionListener {
-                                        try { it.release() } catch (_: Exception) {}
-                                        try { startGeminiAfterSco() } catch (e: Exception) { Log.e(TAG, "Failed to start Gemini Live after chime: ${e.message}") }
-                                    }
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "Error playing chime file at ${candidate.absolutePath}: ${e.message}")
-                                    try { mp.release() } catch (_: Exception) {}
-                                }
-                                played = true
-                                break
+                        Log.d(TAG, "Playing wake chime from res/raw resource")
+                        val mp = MediaPlayer.create(this, R.raw.wake_chime)
+                        mp?.let { player ->
+                            try {
+                                // Ensure playback on music stream and full volume
+                                try { player.setAudioStreamType(AudioManager.STREAM_MUSIC) } catch (_: Exception) {}
+                                try { player.setVolume(1.0f, 1.0f) } catch (_: Exception) {}
+                            } catch (_: Exception) {}
+                            player.setOnCompletionListener {
+                                try { it.release() } catch (_: Exception) {}
                             }
-                        }
-
-                        if (!played) {
-                            // Try packaged raw resource: res/raw/bmw_warning_chime.mp3 (if user adds it)
-                            val resId = resources.getIdentifier("bmw_warning_chime", "raw", packageName)
-                            if (resId != 0) {
-                                Log.d(TAG, "Playing wake chime from res/raw resource")
-                                val mp = MediaPlayer.create(this, resId)
-                                mp?.let { player ->
-                                    try {
-                                        // Ensure playback on music stream and full volume
-                                        try { player.setAudioStreamType(AudioManager.STREAM_MUSIC) } catch (_: Exception) {}
-                                        try { player.setVolume(1.0f, 1.0f) } catch (_: Exception) {}
-                                    } catch (_: Exception) {}
-                                    player.setOnCompletionListener {
-                                        try { it.release() } catch (_: Exception) {}
-                                        try { startGeminiAfterSco() } catch (e: Exception) { Log.e(TAG, "Failed to start Gemini Live after chime: ${e.message}") }
-                                    }
-                                    player.start()
-                                    played = true
-                                }
-                            }
+                            player.start()
+                            // Start connecting IN PARALLEL with the chime. The chime is
+                            // ~1s and the socket/SCO setup does not need the speaker, so
+                            // waiting for playback to finish just added a second of dead
+                            // air before IMI could listen.
+                            startGeminiNow()
+                            played = true
                         }
 
                         if (!played) {
                                 Log.w(TAG, "No chime found; starting Gemini Live immediately (no beep fallback)")
-                                try { startGeminiAfterSco() } catch (e: Exception) { Log.e(TAG, "Failed to start Gemini Live: ${e.message}") }
+                                startGeminiNow()
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "Failed to play chime, starting Gemini Live immediately: ${e.message}")
-                        try { startGeminiLiveConversation() } catch (ex: Exception) { Log.e(TAG, "Failed to start Gemini Live: ${ex.message}") }
+                        startGeminiNow()
                     }
                     
                     voiceCommandEnabled = true
@@ -2439,13 +2722,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
     
     /**
-     * Upload photo to configured server
+     * Upload a captured photo to the IMI Glass backend (/v1/upload/image).
+     *
+     * Auth and threading are handled by ImageUploadSync; the callbacks arrive on a
+     * background thread, hence the runOnUiThread hops. Silently no-ops when the
+     * user is signed out.
      */
     private fun uploadPhotoToServer(file: File) {
-        imageUploadService?.uploadImage(
+        com.sdk.glassessdksample.ui.sync.ImageUploadSync.uploadImage(
+            context = this,
             imageFile = file,
-            onSuccess = { response ->
-                Log.d(TAG, "✅ Image uploaded successfully: $response")
+            source = "smart_glasses",
+            onSuccess = { uploaded ->
+                Log.d(TAG, "✅ Image uploaded: ${uploaded.absoluteUrl} (id=${uploaded.imageId})")
+                lastUploadedImageUrl = uploaded.absoluteUrl
                 runOnUiThread {
                     Toast.makeText(this, "☁️ Photo uploaded to server", Toast.LENGTH_SHORT).show()
                 }
@@ -2599,6 +2889,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 } catch (e: Exception) {
                     Log.w(TAG, "Error stopping AI: ${e.message}")
                 }
+
+                // The background service owns the detector once the screen is off, so
+                // stopping HotHelper here isn't enough — it would keep listening (and
+                // holding the mic + wake lock) after the user muted the AI.
+                try {
+                    startService(
+                        Intent(this, ListeningService::class.java)
+                            .apply { action = ListeningService.ACTION_STOP }
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not stop ListeningService on mute: ${e.message}")
+                }
             } else {
                 // AI is now unmuted - automatically wake up AI
                 binding.tvMuteStatus.text = "AI Listening 🎤"
@@ -2612,6 +2914,108 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         
         Log.d(TAG, "🔇 AI Mute toggled: ${if (isAiMuted) "MUTED" else "UNMUTED"}")
+    }
+
+    /**
+     * Detects "turn on/off conversation mode" style requests and applies them to
+     * the same "continuous_chat" pref the Settings switch writes, so a spoken
+     * change is visible there (and survives a restart).
+     *
+     * Returns true when the utterance was a mode command and has been handled —
+     * callers must then stop treating it as a normal question.
+     *
+     * Recognised: explicit on/off ("turn on conversation mode", "continuous chat
+     * off", Hindi "conversation mode band karo"), plus a bare "conversation
+     * mode" / "continuous chat" which toggles.
+     */
+    private fun handleConversationModeCommand(spoken: String): Boolean {
+        val cmd = spoken.lowercase()
+            // Speech transcripts arrive punctuated ("Turn on conversation mode.")
+            // and Gemini sometimes splits the phrase across chunks, so normalise
+            // punctuation and runs of whitespace before matching.
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        // Both names for the feature: the user-facing "conversation mode" and
+        // the Settings label "Continuous Chat". "conversion/conversational" are
+        // common mis-transcriptions of "conversation" and are accepted too.
+        val mentionsMode = cmd.contains("conversation mode") ||
+            cmd.contains("conversational mode") ||
+            cmd.contains("conversion mode") ||
+            cmd.contains("continuous chat") ||
+            cmd.contains("continuous mode") ||
+            cmd.contains("conversation chat")
+        if (!mentionsMode) return false
+
+        // Direction words, matched on whole words so they can't be found inside
+        // an unrelated word. This matters for "on": "c-on-versation" contains it,
+        // which would make every "turn off conversation mode" look like an "on".
+        // "band"/"chalu" cover the Hindi phrasing used elsewhere in this file.
+        fun hasWord(vararg words: String) =
+            words.any { Regex("\\b${Regex.escape(it)}\\b").containsMatchIn(cmd) }
+
+        val wantsOff = hasWord("off", "stop", "disable", "end", "exit", "band", "close")
+        val wantsOn = hasWord("on", "start", "enable", "begin", "chalu", "shuru", "open")
+
+        // The live transcript streams in growing chunks, so this runs many times
+        // for one spoken sentence. Act once per utterance; the flag is cleared
+        // when the turn ends.
+        if (conversationModeCommandHandled) return true
+        conversationModeCommandHandled = true
+
+        val current = prefs.getBoolean("continuous_chat", CONTINUOUS_CHAT_DEFAULT)
+        // "off" is checked first: "turn off conversation mode" contains "on"
+        // inside "conversation", and a bare mention toggles.
+        val enable = when {
+            wantsOff -> false
+            wantsOn -> true
+            else -> !current
+        }
+
+        prefs.edit().putBoolean("continuous_chat", enable).apply()
+        Log.d(TAG, "🔂 Conversation mode set by voice: $enable (from '$spoken')")
+
+        if (enable) {
+            // Turning it on mid-session: cancel the pending single-reply
+            // shutdown so the conversation just carries on seamlessly.
+            cancelPendingSessionEnd()
+        }
+        return true
+    }
+
+    /**
+     * Clears the "close the session after this reply" state armed by the
+     * Continuous Chat=off path, so the live session stays open.
+     */
+    private fun cancelPendingSessionEnd() {
+        endSessionAfterPlayback = false
+        endSessionFallback?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        endSessionFallback = null
+    }
+
+    /**
+     * Arms the single-reply shutdown: the live session closes as soon as the
+     * current reply finishes playing, so the app falls back to "Hey Imi".
+     *
+     * onAudioPlaybackEnd() is the normal, fast path; the posted task is the
+     * backstop for when that callback never arrives (a text-only reply that
+     * queues no audio, or a dropped playback signal). Whichever runs first
+     * cancels the other. 10 s comfortably outlasts any single spoken reply.
+     */
+    private fun endSessionAfterCurrentReply(reason: String) {
+        endSessionAfterPlayback = true
+        endSessionFallback?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        val fallback = Runnable {
+            if (endSessionAfterPlayback) {
+                endSessionAfterPlayback = false
+                endSessionFallback = null
+                Log.d(TAG, "🔂 $reason - playback-end never arrived, force-stopping AI")
+                stopGeminiLiveConversation(keepHeadsetConnected = true)
+            }
+        }
+        endSessionFallback = fallback
+        Handler(Looper.getMainLooper()).postDelayed(fallback, 10_000)
     }
 
     private fun handleSpokenCommand(command: String) {
@@ -2638,6 +3042,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             lowerCmd.contains("open history")) {
             openConversationHistory()
             speakOut("Opening conversation history", "HISTORY")
+            return
+        }
+
+        // 🔂 Conversation mode on/off by voice. Checked before the generic
+        // command matching below so "stop"/"off" in the phrase isn't swallowed
+        // by another handler. Runs after "conversation history" so that
+        // command keeps its meaning.
+        if (handleConversationModeCommand(command)) {
+            val nowOn = prefs.getBoolean("continuous_chat", CONTINUOUS_CHAT_DEFAULT)
+            speakOut(
+                if (nowOn) "Conversation mode is on. I'll keep listening."
+                else "Conversation mode is off.",
+                "CONVERSATION_MODE"
+            )
             return
         }
         
@@ -5715,6 +6133,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         
         return try {
             when (toolName) {
+                // 🎵 Shazam-style song ID from the ambient audio the live session
+                // is already capturing — no camera, no UI, no second recorder.
+                "identify_song" -> {
+                    kotlinx.coroutines.runBlocking {
+                        com.sdk.glassessdksample.ui.SongIdentifier.identifyFromLiveSession()
+                    }
+                }
+
                 "make_phone_call" -> {
                     val contactName = args["contact_name"] as? String ?: return "Error: No contact name provided"
                     runOnUiThread {
@@ -6771,10 +7197,34 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         geminiLiveService = GeminiLiveService(this, object : GeminiLiveService.GeminiLiveCallbacks {
             override fun onTranscriptionUpdate(input: String, output: String, isFinal: Boolean) {
                 runOnUiThread {
+                    // 🔂 Catch "turn on/off conversation mode" HERE, on the live
+                    // transcript, rather than at turn end. By the time
+                    // onTurnComplete fires Gemini has already answered the
+                    // command as if it were a question — and with the mode OFF
+                    // that reply is the single reply, so the session is already
+                    // closing. Acting on the streaming transcript lets us
+                    // interrupt Gemini and handle the command ourselves.
+                    if (input.isNotEmpty() && handleConversationModeCommand(input)) {
+                        val nowOn = prefs.getBoolean("continuous_chat", CONTINUOUS_CHAT_DEFAULT)
+
+                        // Stop Gemini from answering the command as a question.
+                        geminiLiveService?.interruptCurrentResponse()
+
+                        geminiLiveService?.speakText(
+                            if (nowOn) "Conversation mode is on. I'll keep listening."
+                            else "Conversation mode is off. Say Hey Imi when you need me.",
+                            speakDirectly = true
+                        )
+                        if (!nowOn) {
+                            endSessionAfterCurrentReply("Conversation mode turned off by voice")
+                        }
+                        return@runOnUiThread
+                    }
+
                     // Update UI with live transcriptions
                     if (input.isNotEmpty()) {
                         updateConversation("You", input)
-                        
+
                         // ⛔ REMOVED: Thinking tune in normal conversation
                         // Thinking tune ONLY plays in Vision Chat (VisionChatActivity)
                         // Normal conversation mein tuning nahi chahiye
@@ -6843,9 +7293,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     )
 
                     val lowerInput = fullInput.lowercase()
-                    
+
+                    // 👁️ Snapshot + reset here, at the top, so the flag can never
+                    // survive one of the early returns below and suppress the
+                    // vision fallback on a later turn.
+                    val toolRanThisTurn = toolCalledThisTurn
+                    toolCalledThisTurn = false
+
+                    // 🔂 The mode command was already handled on the live
+                    // transcript (see onTranscriptionUpdate). Clear the guard for
+                    // the next utterance and skip the rest of this turn — in
+                    // particular the single-reply shutdown below, which would
+                    // otherwise close the session right after the user asked to
+                    // keep it open. The Hindi "conversation mode band karo" also
+                    // matches the goodbye list, so this must come first.
+                    if (conversationModeCommandHandled) {
+                        conversationModeCommandHandled = false
+                        Log.d(TAG, "🔂 Turn was a conversation-mode command - already handled")
+                        return@runOnUiThread
+                    }
+
                     // 👋 Check for goodbye command to stop AI until wake word triggers again
-                    if (lowerInput.contains("goodbye imi") || 
+                    if (lowerInput.contains("goodbye imi") ||
                         lowerInput.contains("good bye imi") ||
                         lowerInput.contains("bye imi") ||
                         lowerInput.contains("imi bye") ||
@@ -6870,8 +7339,31 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         return@runOnUiThread
                     }
                     
+                    // 🔂 Continuous Chat OFF → answer once, then go back to the
+                    // wake word. Single-reply mode also skips the spoken greeting
+                    // (see greetOnWake in proceedWithGeminiLive), so the first turn
+                    // here is normally the user's real question. The isNotEmpty
+                    // guard still matters: any model turn with no user speech (a
+                    // stray/empty turn, or a greeting if one is ever re-enabled)
+                    // must not consume the single reply.
+                    // The actual stop happens in onAudioPlaybackEnd() so the reply
+                    // is heard in full instead of being cut off mid-sentence.
+                    // 👁️ ...but NOT while a vision flow is running. analyze_view
+                    // fires mid-turn and its answer arrives 15s+ later, long after
+                    // this reply finishes playing — arming the shutdown here would
+                    // close the very session that has to speak the description.
+                    // The session ends normally on the next turn once vision is done.
+                    val continuousChat = prefs.getBoolean("continuous_chat", CONTINUOUS_CHAT_DEFAULT)
+                    val visionInFlight = visionBusy || visionChatOpenFlag
+                    if (!continuousChat && trimmedInput.isNotEmpty() && !visionInFlight) {
+                        Log.d(TAG, "🔂 Continuous Chat off - ending session once this reply finishes playing")
+                        endSessionAfterCurrentReply("Continuous Chat off")
+                    } else if (visionInFlight) {
+                        Log.d(TAG, "👁️ Vision in flight - keeping session open to speak the result")
+                    }
+
                     // ❌ REMOVED: Vision Chat triggers from Gemini Live - Vision Chat sirf manual open hoga
-                    
+
                     // 🛑 Check for stop vision streaming commands
                     if (isStopVisionCommand(lowerInput)) {
                         Log.d(TAG, "🛑 Stop vision streaming command detected: '$fullInput'")
@@ -6925,8 +7417,33 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         return@runOnUiThread
                     }
                     
-                    // ❌ REMOVED: isVisionChatTrigger check - Vision Chat sirf manual open hoga, voice se nahi
-                    
+                    // 👁️ Deterministic vision fallback (Mark 2).
+                    // The model is told to call analyze_view (see the VISION
+                    // section in GeminiLiveService), but a live model can still
+                    // answer "what is in front of me" verbally instead of calling
+                    // the tool — and then nothing at all happens, which is exactly
+                    // how vision appeared "dead". This catches that case.
+                    //
+                    // Deliberately placed HERE, after the photo-click and video
+                    // checks above, so "take a photo" still just takes a photo.
+                    // Skipped when a tool already ran this turn (the tool path
+                    // handles it, and this must not fight identify_song etc.) and
+                    // when a vision flow is already in flight.
+                    if (!toolRanThisTurn && !visionBusy && !visionChatOpenFlag &&
+                        trimmedInput.isNotEmpty() && isVisionChatTrigger(lowerInput)) {
+                        Log.d(TAG, "👁️ Vision phrase but no tool call - opening Vision Chat: '$fullInput'")
+                        // Continuous Chat=off armed the single-reply shutdown above
+                        // before we knew this was a vision turn. Disarm it, or the
+                        // session dies before the description comes back.
+                        cancelPendingSessionEnd()
+                        // Stop the model from talking over the vision answer it
+                        // is about to be handed.
+                        geminiLiveService?.interruptCurrentResponse()
+                        triggerVisionChatFromLive(fullInput, forceNewCapture = true)
+                        return@runOnUiThread
+                    }
+
+
                     // Check if user wants to exit
                     if (lowerInput.contains("goodbye") || 
                         lowerInput.contains("exit") || 
@@ -6939,6 +7456,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             
             override fun onToolCall(toolName: String, args: Map<String, Any>): String {
                 Log.d(TAG, "🔧 Tool call: $toolName with args: $args")
+                // Tells onTurnComplete that this turn was already actioned, so the
+                // vision fallback there stays out of the way.
+                toolCalledThisTurn = true
                 return handleGeminiToolCall(toolName, args)
             }
             
@@ -6958,9 +7478,25 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     Log.d(TAG, "🎤 AI audio playback ended, listening...")
                     aiIsPlaying = false
                     // Optionally update UI to show listening state
-                    
+
                     // 🆕 Reset last user input time so tune doesn't trigger immediately
                     lastUserInputTime = 0
+
+                    // 🔂 Continuous Chat off: the single reply has now finished
+                    // playing, so close the session immediately instead of waiting
+                    // out the safety timer armed in onTurnComplete.
+                    // keepHeadsetConnected keeps SCO up (same as the goodbye path)
+                    // and stopGeminiLiveConversation re-arms the wake word, putting
+                    // us back on "Hey Imi".
+                    if (endSessionAfterPlayback) {
+                        endSessionAfterPlayback = false
+                        endSessionFallback?.let { handler ->
+                            Handler(Looper.getMainLooper()).removeCallbacks(handler)
+                        }
+                        endSessionFallback = null
+                        Log.d(TAG, "🔂 Continuous Chat off - reply finished, stopping AI until next wake word")
+                        stopGeminiLiveConversation(keepHeadsetConnected = true)
+                    }
                 }
             }
             
@@ -6984,7 +7520,29 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 runOnUiThread {
                     val status = if (isConnected) "🟢 Gemini Live Connected" else "🔴 Disconnected"
                     Log.d(TAG, status)
-                    
+
+                    // 🆕 A vision result was waiting on a session that had died -
+                    // now that the freshly (re)started session is up, speak it.
+                    if (isConnected) {
+                        cancelPendingVisionGiveUp()
+                        pendingVisionTextToSpeak?.let { text ->
+                            pendingVisionTextToSpeak = null
+                            geminiLiveService?.unmuteOutput()
+                            geminiLiveService?.speakText(text, speakDirectly = true)
+                            Log.i(TAG, "🎙️ Pending vision result sent to reconnected Gemini Live")
+                            updateConversation("System", "🎧 Speaking vision result...")
+                            notifyVisionResultSpoken()
+                        }
+                    } else if (pendingVisionTextToSpeak != null) {
+                        // A disconnect here is usually NOT the end of the story: the
+                        // service retries on a fallback model / auto-reconnects, and
+                        // that path reports "connected" again a moment later. Giving
+                        // up immediately dropped the text and closed VisionChat with
+                        // nothing spoken, so wait for the retry to land first and
+                        // only bail out if it never does.
+                        scheduleVisionGiveUp()
+                    }
+
                     if (!isConnected && isGeminiLiveMode) {
                         // Connection lost, restart wake word detection
                         isGeminiLiveMode = false
@@ -7010,7 +7568,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         try {
             audioManager?.let { am ->
                 Log.d(TAG, "🎧 Configuring audio for Glass Headset Mode")
-                
+
                 // Set audio mode for Bluetooth voice call
                 am.mode = AudioManager.MODE_IN_CALL
                 
@@ -7129,6 +7687,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             
             isGeminiLiveMode = false
             isInConversationMode = false
+            // Release the duplicate-start latch so the NEXT wake word can open a
+            // session. Without this the guard in proceedWithGeminiLive() would block
+            // every subsequent conversation, not just the duplicate.
+            isGeminiSessionStarting = false
+            // Clear the single-reply latch (and any pending force-stop) so leftovers
+            // can never end the NEXT conversation on its greeting.
+            endSessionAfterPlayback = false
+            endSessionFallback?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+            endSessionFallback = null
+            // Clear the mode-command guard too: a leftover true would make the
+            // next session drop its first real turn.
+            conversationModeCommandHandled = false
+            // Re-arm the chime-parallel start for the NEXT wake word.
+            geminiStartRequested = false
             currentSessionId = null  // next conversation gets a fresh session
 
             updateConversation("System", "Gemini Live conversation ended")
@@ -7826,6 +8398,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     /**
      * Check if user input is asking to see/describe what's in front
      * Supports Hindi + English phrases
+     *
+     * Used as the fallback in onTurnComplete for when the live model answers a
+     * vision question instead of calling analyze_view. Because it can open Vision
+     * Chat on its own, every phrase here must be unambiguously ABOUT THE VIEW —
+     * generic openers like "show me" or "mujhe batao" belong to ordinary requests
+     * ("show me the weather") and would hijack them.
      */
     private fun isVisionChatTrigger(input: String): Boolean {
         val visionTriggers = listOf(
@@ -7846,8 +8424,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             "what am i looking at",
             "describe this",
             "tell me what you see",
-            "show me",
-            
+            // ❌ NOT "show me" — matches "show me the weather" and hijacks it
+
             // Hindi triggers (romanized) - ONLY VISION ANALYSIS commands
             "mere samne kya hai",
             "mere samne kaun hai",
@@ -7860,9 +8438,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             "dekho ye",
             // ❌ REMOVED: "photo lo", "photo lelo", "photo khicho" - ye sirf photo click hai
             "camera se dekho",
-            "batao kya hai",
-            "batao kaun hai",
-            "mujhe batao",
+            "samne kya dikh raha hai",
+            // ❌ NOT "mujhe batao" / bare "batao ..." — those open almost any
+            // Hindi request ("mujhe mausam batao") and are not about the view
             "kya dikh raha hai"
         )
         
@@ -7922,6 +8500,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // It will stay silent until image description is ready
         geminiLiveService?.muteOutput()
         Log.d(TAG, "🔇 Gemini Live muted - will be silent during vision processing")
+
+        // 🆕 Wake word OFF for the whole vision window. Capture+download+analysis
+        // is a long window (15s+) during which a stray wake word would start a new
+        // Gemini session and destroy the one that must speak this answer.
+        setVisionBusy("vision-chat-launch")
         
         // 🆕 Thinking sound is now WAV tune in VisionChatActivity (not "hmm hmm")
         // geminiLiveService?.playThinkingSound()  // REMOVED - WAV tune plays instead
@@ -7946,6 +8529,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             } catch (e: Exception) {
                 Log.e(TAG, "Error launching Vision Chat", e)
                 visionChatOpenFlag = false
+                // Vision never got off the ground - re-arm the wake word now
+                // rather than waiting out the timeout.
+                clearVisionBusy("vision-chat-launch-failed")
                 // Unmute and use Gemini Live to speak error if available
                 geminiLiveService?.unmuteOutput()
                 geminiLiveService?.speakText("Vision Chat nahi khul paya. Error ho gaya.")
@@ -7955,6 +8541,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     
     // Vision Chat integration variable (reusing existing isWaitingForVisionPhoto from line 77)
     private var pendingVisionQuery: String? = null
+
+    /**
+     * 👁️ Set when the live model calls ANY tool during the current turn, read and
+     * cleared at the start of onTurnComplete. The vision fallback in
+     * onTurnComplete only fires when this is false — i.e. the model talked instead
+     * of acting — so it can never double-trigger on top of a real analyze_view
+     * call, or hijack a turn that identify_song / take_photo already handled.
+     * Written from the websocket thread, read on the main thread.
+     */
+    @Volatile
+    private var toolCalledThisTurn = false
     
     // 🆕 Track if VisionChatActivity is currently open
     // Prevents opening duplicate VisionChat when user says vision command again
@@ -8061,5 +8658,49 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     companion object {
         @Volatile
         var visionChatOpenFlag = false
+
+        /**
+         * 🆕 TRUE for the whole vision operation: photo capture → WiFi download →
+         * AI analysis → spoken answer.
+         *
+         * While this is set, the wake-word detector must stay OFF. The detector
+         * shares the glasses' SCO mic, so a wake word landing mid-analysis tears
+         * down the Gemini Live session and the vision flow with it — the user
+         * loses the answer they were waiting for. Capture can take 15+ seconds
+         * (large photo over the glasses' hotspot), which is a long window for a
+         * stray "Hey Imi" (or any speech that scores over threshold) to kill it.
+         *
+         * Every wake-start path funnels through startWakeWordDetectorIfReady(),
+         * which checks this flag, so no single call site can re-arm the detector
+         * mid-flow. Cleared by clearVisionBusy() once the answer is spoken or the
+         * attempt definitively fails.
+         */
+        @Volatile
+        var visionBusy = false
+
+        /**
+         * Hard cap on the vision suppression window. A large photo over the
+         * glasses' hotspot has been observed taking ~16s to download plus
+         * analysis time, so this is sized well past a slow-but-working run;
+         * it exists only so a crashed/stalled vision flow cannot leave the
+         * assistant permanently deaf to "Hey Imi".
+         */
+        private const val VISION_BUSY_TIMEOUT_MS = 90_000L
+
+        /**
+         * How long a finished vision result waits for a Gemini Live session to come
+         * up before it's abandoned. Sized to cover a model-fallback reconnect (the
+         * service retries on GEMINI_MODEL_FALLBACK, which costs a full connect +
+         * setup round trip) without leaving VisionChatActivity open indefinitely.
+         */
+        private const val VISION_SPEAK_GIVE_UP_MS = 12_000L
+
+        /**
+         * Default for the "continuous_chat" pref (Settings → Conversation).
+         * OFF: each "Hey Imi" gets one answer and the session closes. The user
+         * opts in from Settings or by voice ("turn on conversation mode").
+         * Keep in sync with SettingsActivity.setupSettings().
+         */
+        const val CONTINUOUS_CHAT_DEFAULT = false
     }
 }

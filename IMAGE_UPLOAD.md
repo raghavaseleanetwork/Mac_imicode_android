@@ -1,129 +1,69 @@
 # Image Upload Feature
 
 ## Overview
-The app now supports automatic upload of glasses photos to a server using OkHttp multipart upload.
+
+Photos captured by the glasses are uploaded to the **IMI Glass backend** and stored
+against the signed-in user's account. The backend derives the owning user from the
+access token, so no user ID is ever sent.
+
+Base URL: `http://136.243.196.163:8080` (shared via `AuthApi.BASE_URL`).
 
 ## Components
 
-### 1. ImageUploadService.kt
-Handles HTTP multipart image uploads with:
-- File upload support
-- ByteArray upload support
-- Async callbacks (onSuccess/onError)
-- Configurable timeout settings
+### 1. `ui/sync/ImageUploadApi.kt`
+Networking layer for the two upload endpoints. **Blocking — must be called off the
+main thread.** Follows the same conventions as `VisionApi`: bearer auth via
+`AuthApi.ensureValidAccessToken()` (which refreshes an expired token first), the
+shared base URL, and the `{ "error": { "message": … } }` error envelope.
 
-### 2. Upload Settings Dialog
-Access via **☁️ Upload Settings** button in MainActivity:
-- Enable/disable auto-upload
-- Configure server URL
-- Settings saved in SharedPreferences
+| Method | Endpoint | File part | Notes |
+|---|---|---|---|
+| `uploadImage(file, source)` | `POST /v1/upload/image` | `image` | `source` defaults to `smart_glasses`; returns `uploaded_at` |
+| `uploadImageData(bytes, …)` | `POST /v1/upload/image` | `image` | For raw bytes off the BLE/WiFi transfer |
+| `uploadGlassesImage(file)` | `POST /v1/upload/glasses-image` | `file` | `source` fixed to `glasses` server-side; no `uploaded_at` |
+| `uploadGlassesImageData(bytes, …)` | `POST /v1/upload/glasses-image` | `file` | As above, for raw bytes |
 
-## Configuration
+Returns `Result.Ok(UploadedImage)` or `Result.Err(message, auth, code)`.
 
-### Enable Upload
-1. Open the app
-2. Tap **☁️ Upload Settings** button
-3. Toggle **Enable Auto Upload**
-4. Enter your server URL
-5. Tap **Save**
+### 2. `ui/sync/ImageUploadSync.kt`
+Fire-and-forget front door that moves the blocking calls onto a single-threaded
+executor (uploads are serialised, so back-to-back captures don't compete for
+bandwidth). No-ops when signed out.
 
-### Default Settings
-- **Enabled**: Disabled by default
-- **URL**: `http://10.0.2.2:8080/upload` (Android emulator localhost)
+> ⚠️ Callbacks arrive on a **background thread** — wrap UI work in `runOnUiThread`.
 
-## Server Requirements
+### 3. `UploadSettingsDialog.kt`
+Toggles auto-upload (`auto_upload_enabled` in the `imi_prefs` file) and shows the
+destination plus the signed-in account. The upload URL is **no longer
+configurable** — the old `image_upload_url` setting is retired.
 
-The upload endpoint should accept multipart/form-data with these fields:
-- `image`: Image file (JPEG)
-- `timestamp`: Capture timestamp (milliseconds)
-- `source`: Always "smart_glasses"
+## `UploadedImage`
 
-### Example Node.js Server
-
-```javascript
-const express = require('express');
-const multer = require('multer');
-const path = require('path');
-
-const app = express();
-const upload = multer({ dest: 'uploads/' });
-
-app.post('/upload', upload.single('image'), (req, res) => {
-    console.log('Image received:', req.file);
-    console.log('Timestamp:', req.body.timestamp);
-    console.log('Source:', req.body.source);
-    res.json({ success: true, filename: req.file.filename });
-});
-
-app.listen(8080, () => {
-    console.log('Server listening on port 8080');
-});
+```kotlin
+data class UploadedImage(
+    val imageId: String,     // UUID of the DB record
+    val url: String,         // relative, e.g. "/uploads/<uuid>.png"
+    val uploadedAt: String?  // ISO-8601 UTC; null on the glasses endpoint
+) {
+    val absoluteUrl: String  // BASE_URL + url — use this to render
+}
 ```
 
-### Example Python Flask Server
+`/uploads/…` is served publicly, so `absoluteUrl` can go straight into Glide /
+an `ImageView` **without** an `Authorization` header.
 
-```python
-from flask import Flask, request, jsonify
-import os
+## Usage
 
-app = Flask(__name__)
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-@app.route('/upload', methods=['POST'])
-def upload_image():
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image provided'}), 400
-    
-    image = request.files['image']
-    timestamp = request.form.get('timestamp')
-    source = request.form.get('source')
-    
-    filename = f"glass_{timestamp}.jpg"
-    image.save(os.path.join(UPLOAD_FOLDER, filename))
-    
-    return jsonify({
-        'success': True,
-        'filename': filename,
-        'timestamp': timestamp
-    })
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
-```
-
-## Testing
-
-### With Android Emulator
-1. Run server on host machine (port 8080)
-2. Configure app URL to `http://10.0.2.2:8080/upload`
-3. Enable auto-upload
-4. Capture photo from glasses
-5. Check server logs for upload confirmation
-
-### With Physical Device
-1. Ensure device and server are on same network
-2. Configure app URL to `http://<server-ip>:8080/upload`
-3. Enable auto-upload
-4. Capture photo from glasses
-
-## Logs
-
-Look for these log tags:
-- `ImageUploadService`: Upload operations
-- `SmartGlassAI`: Photo capture and save operations
-
-### Success Log
-```
-📤 Uploading image: glass_photo_1234567890.jpg (152341 bytes)
-✅ Upload successful: {"success":true,"filename":"uploaded.jpg"}
-☁️ Photo uploaded to server
-```
-
-### Error Log
-```
-📤 Uploading image: glass_photo_1234567890.jpg (152341 bytes)
-❌ Image upload failed: Connection refused
+```kotlin
+ImageUploadSync.uploadImage(
+    context = this,
+    imageFile = file,
+    source = "smart_glasses",
+    onSuccess = { uploaded ->
+        runOnUiThread { Glide.with(this).load(uploaded.absoluteUrl).into(imageView) }
+    },
+    onError = { error -> Log.e(TAG, "Upload failed: $error") }
+)
 ```
 
 ## Integration Points
@@ -131,28 +71,45 @@ Look for these log tags:
 ### Photo Capture Flow
 1. Glasses capture photo → BLE transfer
 2. `MyDeviceNotifyListener.parseData()` receives photo data
-3. `savePhoto()` saves to gallery
-4. If auto-upload enabled → `uploadPhotoToServer()` uploads to server
-5. Toast notification on success/failure
+3. `savePhoto()` writes the file and saves it to the Live Gallery
+4. If `auto_upload_enabled` → `uploadPhotoToServer()` → `ImageUploadSync.uploadImage()`
+5. On success the public URL is cached in `lastUploadedImageUrl`; a toast reports the outcome
 
-### VisionChatActivity
-Images from VisionChat HTTP server can also be uploaded by calling:
-```kotlin
-imageUploadService?.uploadImage(file, onSuccess, onError)
-```
+### Related: `VisionSync` / `VisionApi`
+`LiveGalleryManager.savePhoto()` **separately** mirrors every capture to
+`/v1/gallery/photos` (a vision *record*, which also carries the AI description).
+That is a different endpoint with a different purpose — the upload API here just
+stores an image and hands back a URL. Both can run for the same photo.
+
+## Errors & Limits
+
+| Status | Meaning | Handling |
+|---|---|---|
+| `401` / `403` | Missing / invalid / expired token | Token is refreshed proactively; a 401 here means re-login (`Result.Err(auth = true)`) |
+| `413` | File over the size limit | Mapped to a readable message |
+
+Max file size is **10 MB** (12 MB per request); `ImageUploadApi` rejects oversized
+images client-side before spending the upload.
+
+## Requirements
+
+- User must be **signed in** — uploads no-op otherwise.
+- `android:usesCleartextTraffic="true"` is set (the backend is plain HTTP).
+
+## Logs
+
+Look for these tags:
+- `ImageUploadApi` — HTTP failures
+- `ImageUploadSync` — per-upload success (`✅ Uploaded: <url>`) / failure
+- `SmartGlassAI` — photo capture and save operations
 
 ## Troubleshooting
 
-### "Upload failed: Connection refused"
-- Check server is running
-- Verify URL is correct (use 10.0.2.2 for emulator)
-- Check network connectivity
+### Nothing uploads
+- Confirm **Enable Auto Upload** is on and the user is signed in (the dialog warns when not).
 
-### "Upload failed with code 413"
-- Server file size limit exceeded
-- Increase server max upload size
+### "Session expired"
+- The refresh token has lapsed; sign in again.
 
-### Photos not uploading
-- Check **Enable Auto Upload** is toggled on
-- Verify upload URL in settings
-- Check app logs for errors
+### `NetworkOnMainThreadException`
+- `ImageUploadApi` is blocking by design — call it through `ImageUploadSync`.

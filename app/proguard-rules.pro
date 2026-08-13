@@ -24,7 +24,18 @@
 -keep class ai.picovoice.porcupine.** { *; }
 -dontwarn ai.picovoice.porcupine.**
 
+# XXPermissions (com.hjq.permissions) reflects into hidden Android permission
+# APIs and OEM-specific permission activities by class/method name. Without
+# these rules R8 renames those internals in release builds, which crashes
+# every screen that requests permissions on open (e.g. the "Find IMI Glasses"
+# scan page, which calls requestPermissions() from onResume) — this does not
+# reproduce in debug because minification is off there.
+-keep class com.hjq.permissions.** { *; }
+-keepclassmembers class com.hjq.permissions.** { *; }
+-dontwarn com.hjq.permissions.**
+
 # Keep EventBus classes
+-keepattributes *Annotation*
 -keepclassmembers class ** {
     @org.greenrobot.eventbus.Subscribe <methods>;
 }
@@ -39,3 +50,13 @@
 
 # JTransforms (JTransforms/JLargeArrays) references JDK-internal sun.misc.Cleaner, not present on Android
 -dontwarn sun.misc.Cleaner
+
+# ONNX Runtime's native (C++/JNI) side constructs NodeInfo/ValueInfo and other
+# model-metadata classes by calling their Java constructors with a fixed
+# signature looked up at runtime. R8 was renaming/altering those constructors
+# in release builds (no keep rule existed), so the native call no longer
+# matched and the process aborted with SIGABRT as soon as the wake-word model
+# loaded — java.lang.NoSuchMethodError on ai.onnxruntime.NodeInfo.<init>.
+-keep class ai.onnxruntime.** { *; }
+-keepclassmembers class ai.onnxruntime.** { *; }
+-dontwarn ai.onnxruntime.**

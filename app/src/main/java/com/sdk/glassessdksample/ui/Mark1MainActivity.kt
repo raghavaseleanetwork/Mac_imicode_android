@@ -577,7 +577,7 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
                         .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
                         .build()
                 )
-                val afd = resources.openRawResourceFd(R.raw.bmw_warning_chime)
+                val afd = resources.openRawResourceFd(R.raw.wake_chime)
                 setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
                 afd.close()
                 setVolume(1f, 1f)
@@ -1061,6 +1061,7 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
             "stock_quote" -> handleStockQuote(args)
             "mute_ai" -> handleMuteAi()
             "read_notifications" -> handleReadNotifications()
+            "identify_song" -> handleIdentifySong()
             "say_goodbye" -> handleSayGoodbye()
             else -> "Tool $toolName not yet implemented."
         }
@@ -1100,6 +1101,20 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         notesManager?.createNote(title, content, QuickNote.CreatedBy.AI)
         runOnUiThread { Toast.makeText(this, "Note saved: $title", Toast.LENGTH_SHORT).show() }
         return "Note saved successfully."
+    }
+
+    /**
+     * 🎵 Shazam-style song ID from the ambient audio the live session is already
+     * capturing. Returns "Title by Artist" for the model to speak, or a short
+     * plain-language miss message.
+     */
+    private fun handleIdentifySong(): String {
+        return try {
+            kotlinx.coroutines.runBlocking { SongIdentifier.identifyFromLiveSession() }
+        } catch (e: Exception) {
+            Log.e(TAG, "Song identification failed: ${e.message}", e)
+            "I couldn't identify that song right now."
+        }
     }
 
     private fun handleStartMeeting(): String {

@@ -1,6 +1,6 @@
 # 🎤 Hey IMI - Custom Wake Word Detection (ONNX)
 
-## 📋 Overview
+## 📋 Overview       
 
 This implementation replaces Picovoice Porcupine with a **custom ONNX-based "Hey IMI" wake word detector**.
 
@@ -158,7 +158,7 @@ class MainActivity : AppCompatActivity() {
             startGeminiLiveConversation()
         }
     }
-    
+
     override fun onDestroy() {
         super.onDestroy()
         HotHelper.getInstance(this).release()
@@ -279,3 +279,6 @@ app/
 ---
 
 **Your custom "Hey IMI" wake word is ready! 🚀🎉**
+
+---
+

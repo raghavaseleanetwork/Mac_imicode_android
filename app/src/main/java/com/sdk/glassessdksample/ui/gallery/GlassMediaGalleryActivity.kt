@@ -11,6 +11,7 @@ import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
@@ -64,6 +65,10 @@ class GlassMediaGalleryActivity : AppCompatActivity(),
         private const val NEARBY_PERMISSION_REQUEST = 1002
         private const val MENU_SELECT = 2001
         private const val MENU_DELETE = 2002
+        /** The Glass acts as Wi-Fi Direct Group Owner at this fixed address. */
+        private const val GLASS_IP = "192.168.6.1"
+        /** Any interface holding an address in this range is the Glass link. */
+        private const val GLASS_SUBNET_PREFIX = "192.168.6."
         
         fun launch(context: Context) {
             context.startActivity(Intent(context, GlassMediaGalleryActivity::class.java))
@@ -74,6 +79,14 @@ class GlassMediaGalleryActivity : AppCompatActivity(),
     private lateinit var wifiP2pHelper: WifiP2pHelper
     // HTTP-based album downloader for Glass HTTP server (port 80)
     private val albumDownloader by lazy { com.sdk.glassessdksample.ui.wifi.AlbumDownloader(this) }
+    // 🌐 Callback holding the Wi-Fi Direct network. Android routes every socket over
+    // the DEFAULT network (home WiFi, which has internet) unless a socket is explicitly
+    // bound elsewhere. The Glass lives on a P2P-only subnet with no internet, so
+    // unbound sockets were being routed out wlan0 to the home router and dropped:
+    //     failed to connect to /192.168.6.1 (port 80) from /192.168.1.36
+    // Holding this callback both keeps the P2P network alive and gives us the Network
+    // object whose socketFactory pins traffic to the p2p interface.
+    private var p2pNetworkCallback: ConnectivityManager.NetworkCallback? = null
     private val mediaFiles = mutableListOf<GlassMediaTransfer.MediaFileInfo>()
     private var adapter: MediaAdapter? = null
     private val selectedFileNames = mutableSetOf<String>()
@@ -141,11 +154,19 @@ class GlassMediaGalleryActivity : AppCompatActivity(),
                             // Stop P2P discovery — BLE gave us the IP, no need to scan
                             wifiP2pHelper.stopDiscovery()
 
-                            // BLE confirmed the IP — Glass HTTP server is on port 80, go straight to download
+                            // BLE confirmed the IP — Glass HTTP server is on port 80.
+                            // But BLE only proves the Glass is READY, not that the phone
+                            // has a route to it: this notification arrives BEFORE the
+                            // Wi-Fi Direct link finishes forming. Downloading straight
+                            // away therefore ran over home WiFi and timed out with
+                            // "Config fetch error ... after 5000ms" → "No files found".
+                            // Bind to the P2P network first, then fetch.
                             appendConnectionStep("Device connected via BLE")
                             appendConnectionStep("Preparing download")
                             updateConnectionProgress(55)
-                            mainScope.launch { downloadViaHttp(ip) }
+                            bindToP2pNetworkThen {
+                                mainScope.launch { downloadViaHttp(ip) }
+                            }
                         }
                     }
                     
@@ -229,6 +250,11 @@ class GlassMediaGalleryActivity : AppCompatActivity(),
         glassMediaTransfer = GlassMediaTransfer(this)
         glassMediaTransfer.setListener(this)
         
+        // Widen the BLE pipe. The bulk media download here runs over WiFi, but the
+        // BLE link still carries control commands and thumbnail data, so the larger
+        // MTU and faster interval shorten the setup phase before WiFi takes over.
+        com.sdk.glassessdksample.ui.BleSpeedTuner.tune(this, "MediaGallery")
+
         // Register BLE notification listener for Glass IP (type 8)
         // Using listener ID 2 like the original app
         LargeDataHandler.getInstance().addOutDeviceListener(2, bleDeviceNotifyListener)
@@ -1273,6 +1299,113 @@ class GlassMediaGalleryActivity : AppCompatActivity(),
         btnConnect?.isEnabled = true
     }
 
+    /**
+     * 🌐 Acquire the Wi-Fi Direct network and route Glass traffic over it.
+     *
+     * Without this, sockets follow Android's default network. That default is the
+     * phone's home WiFi (it has internet, so the OS prefers it), and the Glass subnet
+     * is only reachable over the p2p interface — so every connection attempt was
+     * routed to the home router and refused. Confirmed from the device routing table:
+     *     192.168.6.1 via 192.168.1.1 dev wlan0 src 192.168.1.36
+     *
+     * requestNetwork() with NET_CAPABILITY_NOT_INTERNET is the supported way to ask
+     * for such a network: the P2P link is deliberately internet-less, so the normal
+     * "give me WiFi" request would never match it.
+     *
+     * [onReady] runs once the network is available and HTTP has been pinned to it.
+     * It is invoked at most once per call, on the main thread.
+     */
+    private fun bindToP2pNetworkThen(onReady: () -> Unit) {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        if (cm == null) {
+            Log.w(TAG, "🌐 No ConnectivityManager — proceeding on default route")
+            onReady()
+            return
+        }
+
+        // Releasing any previous request first: a stale callback from an earlier
+        // attempt would otherwise keep an old (possibly dead) P2P network alive.
+        releaseP2pNetwork()
+
+        // Run off the main thread: isReachable() does real TCP connects.
+        Thread {
+            val bound = tryBindToGlass(cm, GLASS_IP)
+            runOnUiThread {
+                if (bound) {
+                    appendConnectionStep("Network route locked to Glass")
+                } else {
+                    // Say what actually happened. The previous build claimed
+                    // "Network route locked to Glass" even when it had bound to the
+                    // home WiFi, which made a failure look like a success.
+                    appendConnectionStep("No route to Glass yet — trying anyway")
+                }
+                onReady()
+            }
+        }.start()
+    }
+
+    /**
+     * Bind HTTP to whatever network can actually reach [targetIp], if any.
+     *
+     * Mirrors the strategy already proven in VisionChatActivity.ensureGlassNetworkBound().
+     * Order matters, cheapest first:
+     *
+     *  0. Already reachable on current routing? An active Wi-Fi Direct group installs a
+     *     connected route that ConnectivityManager never surfaces as a Network object,
+     *     so this case CANNOT be detected by inspecting networks — only by trying it.
+     *     This is the normal working case and must not be blocked.
+     *  1. Otherwise bind to a connected Network holding an address in the Glass subnet
+     *     (a manually-joined Glass hotspot), and verify it really reaches the Glass.
+     *
+     * Returns true only when the Glass is genuinely reachable — never on a guess.
+     */
+    private fun tryBindToGlass(cm: ConnectivityManager, targetIp: String): Boolean {
+        // 0. Cheapest: does the current routing already work?
+        if (runBlocking { albumDownloader.isReachable(targetIp) }) {
+            Log.i(TAG, "🌐 $targetIp already reachable on current routing — no binding needed")
+            return true
+        }
+
+        // 1. Look for a network whose own address sits in the Glass subnet. Matching on
+        //    the address (not just "is WiFi") is what stops us binding to the home
+        //    network: plain WiFi matches a TRANSPORT_WIFI request, and binding to it
+        //    sent every request out wlan0 to the home router.
+        for (net in cm.allNetworks) {
+            val lp = cm.getLinkProperties(net) ?: continue
+            val iface = lp.interfaceName ?: "?"
+            val matches = lp.linkAddresses.any { la ->
+                la.address?.hostAddress?.startsWith(GLASS_SUBNET_PREFIX) == true
+            }
+            if (!matches) continue
+
+            Log.i(TAG, "🌐 Trying candidate network $net (iface=$iface) for $targetIp")
+            albumDownloader.bindToNetwork(net)
+            if (runBlocking { albumDownloader.isReachable(targetIp) }) {
+                Log.i(TAG, "🌐 Bound Glass HTTP to $net (iface=$iface)")
+                return true
+            }
+            albumDownloader.bindToNetwork(null)
+        }
+
+        Log.w(TAG, "🌐 No network can reach $targetIp — the Wi-Fi Direct group has no " +
+                "interface on this phone. Proceeding on the default route (will likely fail).")
+        return false
+    }
+
+    /** Release the P2P network request and stop forcing HTTP through it. */
+    private fun releaseP2pNetwork() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        p2pNetworkCallback?.let {
+            try {
+                cm?.unregisterNetworkCallback(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "🌐 unregisterNetworkCallback: ${e.message}")
+            }
+        }
+        p2pNetworkCallback = null
+        albumDownloader.bindToNetwork(null)
+    }
+
     // Probes common ports on the given Glass IP; if open port found, set server ip/port and proceed
     private fun testPortsAndProceed(glassIp: String) {
         Thread {
@@ -1280,16 +1413,21 @@ class GlassMediaGalleryActivity : AppCompatActivity(),
             val commonPorts = listOf(80, 8888, 8899, 8080, 9000, 5000)
             var openPort: Int? = null
 
+            // Probe over the SAME network the download will use. A bare Socket() follows
+            // the default route (home WiFi) and reported every port closed even though
+            // the Glass server was up — that was the "Glass server failed to respond".
+            val p2p = albumDownloader.currentBoundNetwork()
             for (port in commonPorts) {
                 try {
-                    Socket().use {
-                        it.connect(InetSocketAddress(glassIp, port), 800)
+                    val sock = p2p?.socketFactory?.createSocket() ?: Socket()
+                    sock.use {
+                        it.connect(InetSocketAddress(glassIp, port), 1500)
                     }
-                    Log.e("PORT_TEST", "✅ OPEN PORT FOUND: $port")
+                    Log.e("PORT_TEST", "✅ OPEN PORT FOUND: $port (bound=${p2p != null})")
                     openPort = port
                     break
                 } catch (e: Exception) {
-                    Log.d("PORT_TEST", "❌ closed $port")
+                    Log.d("PORT_TEST", "❌ closed $port (bound=${p2p != null})")
                 }
             }
 
@@ -1560,6 +1698,9 @@ class GlassMediaGalleryActivity : AppCompatActivity(),
     override fun onDestroy() {
         super.onDestroy()
         mainScope.cancel()
+        // Give the P2P network back before tearing down, so the phone returns to its
+        // normal route and we don't leak the network request.
+        releaseP2pNetwork()
         glassMediaTransfer.disconnect()
         wifiP2pHelper.cleanup()
         
@@ -1627,8 +1768,11 @@ class GlassMediaGalleryActivity : AppCompatActivity(),
             updateConnectionProgress(50)
             updateStatus("📡 Glass IP detected: $glassIp")
 
-            // Probe ports then proceed
-            testPortsAndProceed(glassIp)
+            // Pin traffic to the Wi-Fi Direct network BEFORE probing. Probing first
+            // tested the home-WiFi route, which can never reach the Glass subnet.
+            bindToP2pNetworkThen {
+                testPortsAndProceed(glassIp)
+            }
         }
     }
     

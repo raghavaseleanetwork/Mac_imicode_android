@@ -224,16 +224,7 @@ class SnowboyWakeWordDetector(
     fun isListening(): Boolean = isListening
 
     fun playChimeSound() {
-        try {
-            chimePlayer?.let { player ->
-                if (player.isPlaying) player.seekTo(0) else player.start()
-            } ?: run {
-                android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 100)
-                    .startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 200)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Snowboy chime play failed: ${e.message}")
-        }
+        WakeChime.play(chimePlayer, TAG)
     }
 
     fun processExternalAudio(pcmData: ByteArray) {
@@ -322,26 +313,7 @@ class SnowboyWakeWordDetector(
     }
 
     private fun preloadChimeSound() {
-        try {
-            val resId = context.resources.getIdentifier("chime", "raw", context.packageName)
-            if (resId != 0) {
-                chimePlayer = MediaPlayer.create(context, resId)?.apply { setVolume(1f, 1f) }
-                return
-            }
-
-            try {
-                val afd = context.assets.openFd("sounds/chime.mp3")
-                chimePlayer = MediaPlayer().apply {
-                    setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-                    prepare()
-                    setVolume(1f, 1f)
-                }
-                afd.close()
-            } catch (_: Exception) {
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Snowboy chime preload failed: ${e.message}")
-        }
+        chimePlayer = WakeChime.createPlayer(context)
     }
 
     private fun firstExistingAsset(candidates: List<String>): String? {

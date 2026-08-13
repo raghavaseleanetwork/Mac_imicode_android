@@ -27,6 +27,7 @@ import com.oudmon.ble.base.communication.LargeDataHandler
 import com.oudmon.ble.base.communication.bigData.resp.GlassesDeviceNotifyListener
 import com.oudmon.ble.base.communication.bigData.resp.GlassesDeviceNotifyRsp
 import com.sdk.glassessdksample.ui.GeminiLiveService
+import com.sdk.glassessdksample.ui.HotHelper
 import com.sdk.glassessdksample.ui.TokenUsageTracker
 import com.sdk.glassessdksample.ui.UsageLimitManager
 import com.sdk.glassessdksample.ui.wifi.WifiP2pHelper
@@ -144,6 +145,19 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         
         // 🆕 Extra key for passing vision result text to Gemini Live
         const val EXTRA_VISION_TEXT = "vision_text"
+
+        // 🆕 Broadcast MainActivity sends back once the reconnected Gemini Live
+        // session has actually started speaking the vision result (or definitively
+        // failed to). VisionChatActivity waits for this instead of finishing on a
+        // fixed timer, so it never closes before the summary is audible.
+        const val ACTION_VISION_RESULT_SPOKEN = "com.sdk.glassessdksample.ACTION_VISION_RESULT_SPOKEN"
+
+        // Safety net: if MainActivity never confirms (e.g. reconnect hangs), don't
+        // leave VisionChatActivity open forever - finish anyway after this long.
+        // Must outlast MainActivity's own give-up window (VISION_SPEAK_GIVE_UP_MS,
+        // 12s - long enough for a model-fallback reconnect), otherwise this screen
+        // closes while the session that is about to speak is still coming up.
+        private const val VISION_RESULT_SPOKEN_TIMEOUT_MS = 15000L
     }
     
     // 🆕 Flag: true if launched from Gemini Live (should auto-return after TTS)
@@ -1067,184 +1081,13 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
     
     /**
-     * 🚀 Request higher MTU (Maximum Transmission Unit) for faster BLE transfer
-     * Default MTU is 23 bytes, but we can request up to 512 for faster throughput.
-     * This can result in 5x-10x speed improvement for streaming!
+     * Speed up BLE image transfer. See [com.sdk.glassessdksample.ui.BleSpeedTuner]
+     * — shared with every other Mark 2 screen that pulls images from the glasses.
      */
-    @Suppress("MissingPermission")
     private fun requestHighMtu() {
-        try {
-            val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-            if (bluetoothManager == null) {
-                Log.w(TAG, "⚠️ BluetoothManager not available")
-                return
-            }
-            
-            val connectedDevices = bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
-            Log.d(TAG, "📱 Connected GATT devices: ${connectedDevices.size}")
-            
-            for (device in connectedDevices) {
-                Log.d(TAG, "🔌 Found connected device: ${device.name ?: device.address}")
-                
-                // Try to request MTU via SDK's internal GATT
-                tryRequestMtuViaSdk(device.address)
-            }
-            
-            // Also try via SDK's internal BleManager
-            tryRequestMtuViaInternalGatt()
-            
-            // 🚀 NEW: Direct Glass targeting for MTU boost
-            maximizeBluetoothSpeed()
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "requestHighMtu error: ${e.message}")
-        }
+        com.sdk.glassessdksample.ui.BleSpeedTuner.tune(this, "VisionChat")
     }
-    
-    /**
-     * 🚀 Maximize Bluetooth speed by targeting Glass device directly
-     * This creates a new GATT connection just to request higher MTU
-     */
-    @Suppress("MissingPermission")
-    private fun maximizeBluetoothSpeed() {
-        try {
-            val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-            if (bluetoothManager == null) return
-            
-            val devices = bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
-            
-            for (device in devices) {
-                // Find Glass device by name or known MAC patterns
-                val isGlass = device.name?.contains("Glass", ignoreCase = true) == true ||
-                              device.name?.contains("IMI", ignoreCase = true) == true ||
-                              device.name?.contains("Cyan", ignoreCase = true) == true ||
-                              device.address?.startsWith("F7:36") == true ||  // Known Glass MAC prefix
-                              device.address?.startsWith("C8:") == true
-                
-                if (isGlass) {
-                    Log.i(TAG, "🎯 Found Glass device: ${device.name} (${device.address})")
-                    Log.d(TAG, "🚀 Requesting MTU 512 for faster streaming...")
-                    
-                    // Connect GATT just to request MTU
-                    device.connectGatt(this, false, object : BluetoothGattCallback() {
-                        override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
-                            if (newState == BluetoothProfile.STATE_CONNECTED && gatt != null) {
-                                Log.d(TAG, "📡 GATT connected, requesting MTU 512...")
-                                gatt.requestMtu(512)
-                            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                                gatt?.close()
-                            }
-                        }
-                        
-                        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
-                            if (status == BluetoothGatt.GATT_SUCCESS) {
-                                Log.i(TAG, "✅ MTU BOOST SUCCESS! New size: $mtu bytes (was ~46)")
-                                Log.i(TAG, "🚀 Speed increase: ${mtu / 46}x faster!")
-                            } else {
-                                Log.w(TAG, "⚠️ MTU change failed, status: $status")
-                            }
-                            // Don't disconnect - keep for future use
-                        }
-                    })
-                    return // Only need to do this for one Glass
-                }
-            }
-            
-            Log.w(TAG, "⚠️ No Glass device found in connected GATT devices")
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "maximizeBluetoothSpeed error: ${e.message}")
-        }
-    }
-    
-    /**
-     * Try to request MTU via SDK's internal BluetoothGatt object
-     */
-    @Suppress("MissingPermission")
-    private fun tryRequestMtuViaInternalGatt() {
-        try {
-            val handler = LargeDataHandler.getInstance()
-            
-            // Look for BluetoothGatt in SDK internals
-            for (field in handler.javaClass.declaredFields) {
-                try {
-                    field.isAccessible = true
-                    val value = field.get(handler) ?: continue
-                    
-                    // Check nested objects for GATT
-                    findAndRequestMtu(value, 0)
-                } catch (_: Exception) {}
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "tryRequestMtuViaInternalGatt error: ${e.message}")
-        }
-    }
-    
-    /**
-     * Recursively search for BluetoothGatt object and request MTU
-     */
-    @Suppress("MissingPermission")
-    private fun findAndRequestMtu(obj: Any?, depth: Int) {
-        if (obj == null || depth > 4) return
-        
-        try {
-            if (obj is BluetoothGatt) {
-                Log.i(TAG, "🎯 Found BluetoothGatt! Requesting MTU 512...")
-                val result = obj.requestMtu(512)
-                Log.d(TAG, "📡 MTU request sent: $result")
-                return
-            }
-            
-            val cls = obj.javaClass
-            for (field in cls.declaredFields) {
-                try {
-                    field.isAccessible = true
-                    val value = field.get(obj) ?: continue
-                    
-                    if (value is BluetoothGatt) {
-                        Log.i(TAG, "🎯 Found BluetoothGatt in ${cls.simpleName}.${field.name}! Requesting MTU 512...")
-                        val result = value.requestMtu(512)
-                        Log.d(TAG, "📡 MTU request sent: $result")
-                        return
-                    }
-                    
-                    // Recurse into BLE-related objects
-                    val valName = value.javaClass.name.lowercase()
-                    if (valName.contains("ble") || valName.contains("gatt") || valName.contains("bluetooth")) {
-                        findAndRequestMtu(value, depth + 1)
-                    }
-                } catch (_: Exception) {}
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "findAndRequestMtu error: ${e.message}")
-        }
-    }
-    
-    /**
-     * Try to request MTU via SDK method if available
-     */
-    private fun tryRequestMtuViaSdk(deviceAddress: String) {
-        try {
-            val handler = LargeDataHandler.getInstance()
-            
-            // Look for setMtu or requestMtu methods
-            for (method in handler.javaClass.methods) {
-                val mName = method.name.lowercase()
-                if (mName.contains("mtu") && method.parameterTypes.isNotEmpty()) {
-                    try {
-                        if (method.parameterTypes[0] == Int::class.java) {
-                            method.invoke(handler, 512)
-                            Log.i(TAG, "✅ Called SDK method ${method.name}(512)")
-                            return
-                        }
-                    } catch (_: Exception) {}
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "tryRequestMtuViaSdk error: ${e.message}")
-        }
-    }
-    
+
     /**
      * Check if we have nearby devices permission
      */
@@ -1475,32 +1318,131 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
     
+    private var visionResultSpokenReceiver: android.content.BroadcastReceiver? = null
+    private var visionResultSpokenTimeoutRunnable: Runnable? = null
+
+    /**
+     * 🆕 Turn wake-word detection OFF for the vision window. The detector shares
+     * the glasses' SCO mic; a wake word landing during capture/download/analysis
+     * starts a fresh Gemini Live session and destroys the one that is about to
+     * speak this answer. See MainActivity.visionBusy.
+     */
+    private fun engageVisionWakeSuppression() {
+        if (MainActivity.visionBusy) return
+        MainActivity.visionBusy = true
+        try {
+            HotHelper.getInstance(this).setSuppressed(true)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to suppress wake word for vision: ${e.message}")
+        }
+        Log.i(TAG, "👁️ Wake word suppressed for vision capture/analysis")
+    }
+
+    /**
+     * 🆕 Release the vision window. Used by paths that finish inside this
+     * activity (standalone TTS), where MainActivity never runs the resume flow
+     * that would otherwise release it.
+     */
+    private fun releaseVisionWakeSuppression(reason: String) {
+        if (!MainActivity.visionBusy) return
+        MainActivity.visionBusy = false
+        try {
+            HotHelper.getInstance(this).setSuppressed(false)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to release wake suppression ($reason): ${e.message}")
+        }
+        Log.i(TAG, "👁️ Wake word suppression released ($reason)")
+    }
+
     /**
      * 🆕 Resume Gemini Live conversation and close this activity
-     * Sends broadcast to MainActivity to restart Gemini Live with vision result
+     * Sends broadcast to MainActivity to restart Gemini Live with vision result.
+     * 🆕 Does NOT finish on a fixed timer anymore - a dead/reconnecting Gemini Live
+     * session can take longer than any fixed delay to actually speak, and closing
+     * this screen before that happens loses the summary and confuses the user
+     * ("it exits vision chat without speaking"). Instead this waits for
+     * MainActivity to confirm (via ACTION_VISION_RESULT_SPOKEN) that speaking has
+     * actually started, with a generous timeout as a safety net only.
      * @param visionText The vision analysis result for Gemini Live to speak
      */
     private fun resumeGeminiLiveAndFinish(visionText: String? = null) {
         runOnUiThread {
             Log.i(TAG, "📡 Broadcasting resume Gemini Live with vision text: ${visionText?.take(50)}...")
-            
+
+            val lbm = androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this)
+
+            if (visionResultSpokenReceiver == null) {
+                visionResultSpokenReceiver = object : android.content.BroadcastReceiver() {
+                    override fun onReceive(context: Context?, intent: Intent?) {
+                        Log.d(TAG, "👋 Gemini Live confirmed speaking - finishing VisionChatActivity")
+                        finishAfterVisionResultResolved()
+                    }
+                }
+                lbm.registerReceiver(
+                    visionResultSpokenReceiver!!,
+                    IntentFilter(ACTION_VISION_RESULT_SPOKEN)
+                )
+            }
+
             // Send broadcast to MainActivity to resume Gemini Live
             val resumeIntent = Intent(ACTION_RESUME_GEMINI_LIVE)
             visionText?.let {
                 resumeIntent.putExtra(EXTRA_VISION_TEXT, it)
             }
-            androidx.localbroadcastmanager.content.LocalBroadcastManager
-                .getInstance(this)
-                .sendBroadcast(resumeIntent)
-            
-            // Small delay then finish this activity
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                Log.d(TAG, "👋 Finishing VisionChatActivity, returning to Gemini Live")
-                finish()
-            }, 500)
+            lbm.sendBroadcast(resumeIntent)
+
+            // Safety net only - MainActivity failing to ever confirm shouldn't trap
+            // the user on this screen forever.
+            visionResultSpokenTimeoutRunnable?.let {
+                android.os.Handler(android.os.Looper.getMainLooper()).removeCallbacks(it)
+            }
+            visionResultSpokenTimeoutRunnable = Runnable {
+                Log.w(TAG, "⏱️ Timed out waiting for Gemini Live speak confirmation - finishing anyway")
+                finishAfterVisionResultResolved()
+            }
+            android.os.Handler(android.os.Looper.getMainLooper())
+                .postDelayed(visionResultSpokenTimeoutRunnable!!, VISION_RESULT_SPOKEN_TIMEOUT_MS)
         }
     }
+
+    private fun finishAfterVisionResultResolved() {
+        visionResultSpokenTimeoutRunnable?.let {
+            android.os.Handler(android.os.Looper.getMainLooper()).removeCallbacks(it)
+        }
+        visionResultSpokenTimeoutRunnable = null
+        visionResultSpokenReceiver?.let {
+            androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this).unregisterReceiver(it)
+        }
+        visionResultSpokenReceiver = null
+        finish()
+    }
     
+    /**
+     * 🆕 Poll briefly for Gemini Live to reconnect before falling back to
+     * resumeGeminiLiveAndFinish(). Avoids closing VisionChatActivity just because
+     * the websocket happened to be momentarily down when the vision response landed.
+     */
+    private fun waitForGeminiLiveThenResume(
+        visionText: String,
+        attemptsLeft: Int = 6,
+        retryDelayMs: Long = 300
+    ) {
+        val geminiLive = GeminiLiveService.getInstance()
+        if (geminiLive != null && GeminiLiveService.isActive()) {
+            Log.i(TAG, "🎙️ Gemini Live reconnected - speaking vision result instead of finishing")
+            speakVisionResultImmediately(visionText)
+            return
+        }
+        if (attemptsLeft <= 0) {
+            Log.i(TAG, "🔄 Gemini Live still not active after waiting - resuming/finishing")
+            resumeGeminiLiveAndFinish(visionText)
+            return
+        }
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            waitForGeminiLiveThenResume(visionText, attemptsLeft - 1, retryDelayMs)
+        }, retryDelayMs)
+    }
+
     private fun speakOut(text: String) {
         if (isTtsReady && tts != null) {
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "vision_${System.currentTimeMillis()}")
@@ -1549,7 +1491,10 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             // 🆕 Speak COMPLETE description - Gemini Live will speak it fully
             // speakDirectly = true means Gemini will read the ENTIRE text without stopping
             geminiLive.speakText(text, speakDirectly = true)
-            
+
+            // 🆕 Answer is being spoken on the live session - vision window over.
+            releaseVisionWakeSuppression("spoken-via-gemini-live")
+
             // ⛔ DISABLE auto-capture completely - user must manually trigger capture
             Log.d(TAG, "🛑 Auto-capture DISABLED - manual capture mode only")
             shouldAutoCaptureNext = false
@@ -1575,9 +1520,13 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             Log.d(TAG, "🔊 Vision description sent - will auto-capture in ~${estimatedSpeakTimeMs/1000}s")
             
         } else if (shouldResumeGeminiLive) {
-            // Gemini Live was stopped - restart it with vision text
-            Log.i(TAG, "🔄 Gemini Live not active - restarting with vision text")
-            resumeGeminiLiveAndFinish(text)
+            // 🆕 Gemini Live isn't active RIGHT NOW, but it may just be mid-reconnect
+            // (e.g. a brief websocket drop that coincides with the vision response
+            // arriving). Give it a short grace period to come back before treating
+            // this as "user is done" and closing the screen — otherwise this race
+            // causes VisionChatActivity to randomly finish() right after a summary.
+            Log.i(TAG, "🔄 Gemini Live not active - waiting briefly for reconnect before resuming/finishing")
+            waitForGeminiLiveThenResume(text)
 
         } else {
             // 🆕 Standalone mode (opened directly, not via Gemini Live): speak the
@@ -1587,6 +1536,9 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             Log.d(TAG, "🔊 Gemini Live unavailable — speaking vision result via TTS")
             lastSpokenDescription = trimmedText
             speakOut(text)
+            // 🆕 Standalone path finishes here - MainActivity never runs the resume
+            // flow, so release the vision window ourselves.
+            releaseVisionWakeSuppression("spoken-via-tts")
         }
     }
     
@@ -1675,7 +1627,7 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         frameCount = 0
         lastFrameTime = System.currentTimeMillis()
         
-        bleContinuousStreamManager?.startStreaming { frameBytes ->
+        bleContinuousStreamManager?.startStreaming(this) { frameBytes ->
             // ✅ Got new frame from BLE - process it!
             frameCount++
             val now = System.currentTimeMillis()
@@ -1863,6 +1815,11 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             Toast.makeText(this, "Already processing...", Toast.LENGTH_SHORT).show()
             return
         }
+
+        // 🆕 Wake word OFF for the whole capture → analysis → answer window.
+        // Set here (not only in MainActivity.triggerVisionChatFromLive) so it also
+        // covers VisionChat opened directly by the user rather than by voice.
+        engageVisionWakeSuppression()
         
         // 🆕 Check if this is a follow-up question on the same image
         // Skip this check during continuous streaming (we always want new captures)
@@ -3337,10 +3294,25 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     
     override fun onDestroy() {
         super.onDestroy()
-        
+
+        // 🆕 Clean up the vision-result-spoken wait, if one was still pending
+        visionResultSpokenTimeoutRunnable?.let {
+            android.os.Handler(android.os.Looper.getMainLooper()).removeCallbacks(it)
+        }
+        visionResultSpokenTimeoutRunnable = null
+        visionResultSpokenReceiver?.let {
+            androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this).unregisterReceiver(it)
+        }
+        visionResultSpokenReceiver = null
+
         // 🆕 Reset MainActivity's visionChatOpenFlag
         MainActivity.visionChatOpenFlag = false
         Log.d(TAG, "🔄 VisionChat closed - reset visionChatOpenFlag")
+
+        // 🆕 Safety net: if the user backed out mid-analysis, the vision window
+        // never completed - make sure wake word detection isn't left suppressed.
+        // (MainActivity re-arms the detector in onResume.)
+        releaseVisionWakeSuppression("vision-chat-destroyed")
         
         // 🔊 UNMUTE Gemini Live in case activity closes without completing
         // This ensures Gemini Live is responsive even if user backs out

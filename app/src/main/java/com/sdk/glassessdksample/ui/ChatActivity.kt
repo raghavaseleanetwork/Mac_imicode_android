@@ -429,6 +429,10 @@ class ChatActivity : AppCompatActivity() {
             Toast.makeText(this, "Already capturing...", Toast.LENGTH_SHORT).show()
             return
         }
+        // Widen the BLE pipe before the image starts moving. At the default MTU a
+        // photo takes hundreds of round trips; see BleSpeedTuner.
+        BleSpeedTuner.tune(this, "Chat/capture")
+
         val typed = etChatInput.text.toString().trim()
         val query = if (typed.isNotBlank()) typed else "Describe what you see in detail"
         if (typed.isNotBlank()) etChatInput.setText("")
