@@ -6,13 +6,9 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.RadialGradient
 import android.graphics.RectF
-import android.graphics.Shader
-import android.graphics.SweepGradient
 import android.graphics.Typeface
 import android.util.AttributeSet
 import android.util.TypedValue
@@ -26,8 +22,11 @@ import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.sin
-import kotlin.random.Random
 
+/**
+ * Center glasses circle surrounded by an orbiting-dots swirl, matching the
+ * animated "IMI" constellation used on the Mark I BLE gate screen (DotsOrbitView).
+ */
 class RadarScanView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
@@ -42,42 +41,31 @@ class RadarScanView @JvmOverloads constructor(
         val labelYOffset: Float
     )
 
-    private data class Particle(
-        val angle: Float,
-        val radiusFactor: Float,
-        val size: Float,
-        val phase: Float
+    // Each dot orbits around the center. tone: 0 = orange, 1 = light orange, 2 = warm accent
+    private data class Dot(
+        val angleDeg: Float,
+        val radiusFraction: Float,
+        val sizeDp: Float,
+        val baseAlpha: Float,
+        val tone: Int,
+        var phase: Float = 0f,
+        var speed: Float = 0.5f
     )
 
-    private val colorBackgroundPrimary = ContextCompat.getColor(context, R.color.background_primary)
-    private val colorBackgroundSecondary = ContextCompat.getColor(context, R.color.background_secondary)
-    private val colorCardBackground = ContextCompat.getColor(context, R.color.card_background)
     private val colorTextPrimary = ContextCompat.getColor(context, R.color.text_primary)
-    private val colorAccentWarm = ContextCompat.getColor(context, R.color.accent_warm_gray)
     private val colorAccentSilver = ContextCompat.getColor(context, R.color.accent_silver)
     private val colorAccentGlow = ContextCompat.getColor(context, R.color.accent_glow)
 
-    private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = dp(1f)
-        color = withAlpha(colorAccentSilver, 0.22f)
-    }
+    // Same orange theme as DotsOrbitView, so both animations look identical
+    private val colorOrange = Color.parseColor("#FF7F2E")
+    private val colorOrangeLight = Color.parseColor("#FFB07A")
+    private val colorAccent = Color.parseColor("#FFD9B8")
 
-    private val glowRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = dp(2f)
-        color = withAlpha(colorAccentGlow, 0.82f)
-    }
+    private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
 
     private val centerFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = colorCardBackground
-    }
-
-    private val centerStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = dp(2f)
-        color = withAlpha(colorAccentSilver, 0.75f)
+        color = Color.parseColor("#3D2C1E")
     }
 
     private val blipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -115,18 +103,60 @@ class RadarScanView @JvmOverloads constructor(
     private val centerImagePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true }
     private val deviceImagePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true }
 
-    private val radarSweepPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val radarSweepSecondaryPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val sweepMatrix = Matrix()
-    private val secondarySweepMatrix = Matrix()
-
     private val centerClipPath = Path()
     private val blipClipPath = Path()
 
     private val blips = mutableListOf<Blip>()
-    private val particles = mutableListOf<Particle>()
 
-    private var sweepAngle = 0f
+    private val dots = listOf(
+        // Primary orange dots — prominent
+        Dot(15f,  0.55f, 7f,  0.90f, 0),
+        Dot(55f,  0.80f, 9f,  0.95f, 0),
+        Dot(90f,  0.65f, 6f,  0.80f, 0),
+        Dot(130f, 0.88f, 10f, 1.00f, 0),
+        Dot(165f, 0.58f, 7f,  0.85f, 0),
+        Dot(200f, 0.75f, 9f,  0.90f, 0),
+        Dot(240f, 0.62f, 6f,  0.80f, 0),
+        Dot(275f, 0.85f, 8f,  0.95f, 0),
+        Dot(310f, 0.55f, 7f,  0.85f, 0),
+        Dot(340f, 0.78f, 9f,  0.90f, 0),
+        Dot(5f,   0.92f, 8f,  0.92f, 0),
+        Dot(70f,  0.50f, 6f,  0.82f, 0),
+        Dot(150f, 0.82f, 9f,  0.95f, 0),
+        Dot(225f, 0.90f, 8f,  0.90f, 0),
+        Dot(300f, 0.70f, 7f,  0.85f, 0),
+        // Softer / smaller light-orange
+        Dot(35f,  0.70f, 5f,  0.70f, 1),
+        Dot(110f, 0.72f, 5f,  0.65f, 1),
+        Dot(185f, 0.68f, 4f,  0.60f, 1),
+        Dot(255f, 0.73f, 5f,  0.70f, 1),
+        Dot(320f, 0.67f, 4f,  0.65f, 1),
+        Dot(50f,  0.95f, 5f,  0.68f, 1),
+        Dot(125f, 0.60f, 5f,  0.66f, 1),
+        Dot(170f, 0.92f, 4f,  0.62f, 1),
+        Dot(280f, 0.60f, 5f,  0.70f, 1),
+        Dot(345f, 0.62f, 4f,  0.64f, 1),
+        // Warm accent dots — small
+        Dot(25f,  0.42f, 4f,  0.50f, 2),
+        Dot(75f,  0.38f, 3f,  0.45f, 2),
+        Dot(145f, 0.45f, 4f,  0.55f, 2),
+        Dot(215f, 0.40f, 3f,  0.45f, 2),
+        Dot(290f, 0.43f, 4f,  0.50f, 2),
+        Dot(355f, 0.39f, 3f,  0.40f, 2),
+        Dot(60f,  0.48f, 3f,  0.42f, 2),
+        Dot(120f, 0.35f, 3f,  0.48f, 2),
+        Dot(190f, 0.50f, 4f,  0.52f, 2),
+        Dot(250f, 0.36f, 3f,  0.44f, 2),
+        Dot(330f, 0.47f, 4f,  0.50f, 2),
+    ).also { list ->
+        list.forEachIndexed { i, dot ->
+            dot.phase = (i * 0.6f) % (2f * PI.toFloat())
+            dot.speed = 1.15f - dot.radiusFraction
+        }
+    }
+
+    private var orbitAngle = 0f
+    private var twinkleAngle = 0f
     private var pulsePhase = 0f
     private var isScanning = false
 
@@ -135,12 +165,22 @@ class RadarScanView @JvmOverloads constructor(
 
     var onDeviceClick: ((SmartWatch) -> Unit)? = null
 
-    private val sweepAnimator = ValueAnimator.ofFloat(0f, 360f).apply {
-        duration = 2500L
+    private val orbitAnimator = ValueAnimator.ofFloat(0f, 2f * PI.toFloat()).apply {
+        duration = 10000L
         repeatCount = ValueAnimator.INFINITE
         interpolator = LinearInterpolator()
         addUpdateListener {
-            sweepAngle = it.animatedValue as Float
+            orbitAngle = it.animatedValue as Float
+            invalidate()
+        }
+    }
+
+    private val twinkleAnimator = ValueAnimator.ofFloat(0f, 2f * PI.toFloat()).apply {
+        duration = 3000L
+        repeatCount = ValueAnimator.INFINITE
+        interpolator = LinearInterpolator()
+        addUpdateListener {
+            twinkleAngle = it.animatedValue as Float
             invalidate()
         }
     }
@@ -160,12 +200,9 @@ class RadarScanView @JvmOverloads constructor(
         if (isScanning == scanning) return
         isScanning = scanning
         if (scanning) {
-            if (!sweepAnimator.isStarted) sweepAnimator.start()
             if (!pulseAnimator.isStarted) pulseAnimator.start()
         } else {
-            sweepAnimator.cancel()
             pulseAnimator.cancel()
-            sweepAngle = 0f
             pulsePhase = 0f
             invalidate()
         }
@@ -213,27 +250,22 @@ class RadarScanView @JvmOverloads constructor(
         invalidate()
     }
 
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
-        if (w <= 0 || h <= 0) return
-
-        particles.clear()
-        repeat(24) {
-            particles.add(
-                Particle(
-                    angle = Random.nextFloat() * (2f * PI.toFloat()),
-                    radiusFactor = 0.20f + Random.nextFloat() * 0.78f,
-                    size = dp(1f) + Random.nextFloat() * dp(1.8f),
-                    phase = Random.nextFloat() * (2f * PI.toFloat())
-                )
-            )
-        }
+    init {
+        orbitAnimator.start()
+        twinkleAnimator.start()
     }
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
-        sweepAnimator.cancel()
+        orbitAnimator.cancel()
+        twinkleAnimator.cancel()
         pulseAnimator.cancel()
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (!orbitAnimator.isRunning) orbitAnimator.start()
+        if (!twinkleAnimator.isRunning) twinkleAnimator.start()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -243,105 +275,36 @@ class RadarScanView @JvmOverloads constructor(
         val cy = height / 2f
         val radarRadius = min(width, height) * 0.42f
 
-        drawRadarGlow(canvas, cx, cy, radarRadius)
-        drawAmbientParticles(canvas, cx, cy, radarRadius)
-        drawRings(canvas, cx, cy, radarRadius)
-        drawSweep(canvas, cx, cy, radarRadius)
+        drawOrbitingDots(canvas, cx, cy, radarRadius)
         drawCenter(canvas, cx, cy, radarRadius * 0.23f)
         drawBlips(canvas)
     }
 
-    private fun drawRadarGlow(canvas: Canvas, cx: Float, cy: Float, radius: Float) {
-        val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            shader = RadialGradient(
-                cx,
-                cy,
-                radius,
-                intArrayOf(
-                    withAlpha(colorBackgroundSecondary, 0.96f),
-                    withAlpha(colorCardBackground, 0.92f),
-                    withAlpha(colorBackgroundPrimary, 1f)
-                ),
-                floatArrayOf(0f, 0.62f, 1f),
-                Shader.TileMode.CLAMP
-            )
-        }
-        canvas.drawCircle(cx, cy, radius, glow)
-    }
+    private fun drawOrbitingDots(canvas: Canvas, cx: Float, cy: Float, maxR: Float) {
+        dots.forEach { dot ->
+            val angleRad = Math.toRadians(dot.angleDeg.toDouble()) + orbitAngle * dot.speed
+            val breathe = 1f + 0.06f * sin((orbitAngle * 2f + dot.phase).toDouble()).toFloat()
+            val r = maxR * dot.radiusFraction * breathe
+            val x = cx + (r * cos(angleRad)).toFloat()
+            val y = cy + (r * sin(angleRad)).toFloat()
 
-    private fun drawAmbientParticles(canvas: Canvas, cx: Float, cy: Float, radius: Float) {
-        if (particles.isEmpty()) return
+            val tw = 0.75f + 0.25f * sin((twinkleAngle + dot.phase).toDouble()).toFloat()
+            val alpha = (dot.baseAlpha * tw * 255).toInt().coerceIn(0, 255)
 
-        particles.forEach { particle ->
-            val x = cx + cos(particle.angle) * (radius * particle.radiusFactor)
-            val y = cy + sin(particle.angle) * (radius * particle.radiusFactor)
-            val wave = 0.5f + 0.5f * kotlin.math.sin((pulsePhase * PI * 2f + particle.phase).toFloat())
-            val alphaBase = 0.08f + 0.22f * wave
-            val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                style = Paint.Style.FILL
-                color = withAlpha(colorAccentGlow, alphaBase)
+            dotPaint.alpha = alpha
+            dotPaint.color = when (dot.tone) {
+                0 -> colorOrange
+                1 -> colorOrangeLight
+                else -> colorAccent
             }
-            canvas.drawCircle(x, y, particle.size, dotPaint)
+
+            val radius = dp(dot.sizeDp) / 2f
+            canvas.drawCircle(x, y, radius, dotPaint)
         }
-    }
-
-    private fun drawRings(canvas: Canvas, cx: Float, cy: Float, radius: Float) {
-        for (index in 1..4) {
-            val ringRadius = radius * (index / 4f)
-            canvas.drawCircle(cx, cy, ringRadius, ringPaint)
-        }
-        canvas.drawCircle(cx, cy, radius * 0.75f, glowRingPaint)
-    }
-
-    private fun drawSweep(canvas: Canvas, cx: Float, cy: Float, radius: Float) {
-        if (!isScanning) return
-
-        radarSweepPaint.shader = SweepGradient(
-            cx,
-            cy,
-            intArrayOf(
-                Color.TRANSPARENT,
-                withAlpha(colorAccentWarm, 0.10f),
-                withAlpha(colorAccentGlow, 0.42f),
-                Color.TRANSPARENT
-            ),
-            floatArrayOf(0f, 0.74f, 0.86f, 1f)
-        )
-
-        sweepMatrix.reset()
-        sweepMatrix.postRotate(sweepAngle, cx, cy)
-        radarSweepPaint.shader?.setLocalMatrix(sweepMatrix)
-
-        radarSweepSecondaryPaint.shader = SweepGradient(
-            cx,
-            cy,
-            intArrayOf(
-                Color.TRANSPARENT,
-                withAlpha(colorAccentSilver, 0.05f),
-                withAlpha(colorAccentGlow, 0.18f),
-                Color.TRANSPARENT
-            ),
-            floatArrayOf(0f, 0.55f, 0.66f, 1f)
-        )
-
-        secondarySweepMatrix.reset()
-        secondarySweepMatrix.postRotate(-sweepAngle * 0.62f, cx, cy)
-        radarSweepSecondaryPaint.shader?.setLocalMatrix(secondarySweepMatrix)
-
-        canvas.drawCircle(cx, cy, radius, radarSweepPaint)
-        canvas.drawCircle(cx, cy, radius * 0.84f, radarSweepSecondaryPaint)
     }
 
     private fun drawCenter(canvas: Canvas, cx: Float, cy: Float, radius: Float) {
         canvas.drawCircle(cx, cy, radius, centerFillPaint)
-        canvas.drawCircle(cx, cy, radius, centerStrokePaint)
-
-        val pulsePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = dp(2f)
-            color = withAlpha(colorAccentGlow, 0.45f)
-        }
-        canvas.drawCircle(cx, cy, radius + dp(6f) * pulsePhase, pulsePaint)
 
         val image = centerGlassesBitmap
         if (image != null) {
