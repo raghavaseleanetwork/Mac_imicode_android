@@ -6133,6 +6133,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         
         return try {
             when (toolName) {
+                // 🌐 Browser tools drive an off-screen WebView that shares its
+                // cookies with the Web section, so the user's logins carry over.
+                in com.sdk.glassessdksample.ui.web.GlassBrowserTools.TOOL_NAMES -> {
+                    com.sdk.glassessdksample.ui.web.GlassBrowserTools
+                        .handleBlocking(this@MainActivity, toolName, args)
+                }
+
                 // 🎵 Shazam-style song ID from the ambient audio the live session
                 // is already capturing — no camera, no UI, no second recorder.
                 "identify_song" -> {

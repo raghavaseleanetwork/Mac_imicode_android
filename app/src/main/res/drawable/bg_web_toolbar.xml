@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Address bar pill — matches the More screen card language. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#191C1B" />
+    <corners android:radius="22dp" />
+    <stroke android:width="0.5dp" android:color="#D6FF8D28" />
+</shape>

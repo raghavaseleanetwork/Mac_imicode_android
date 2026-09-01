@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Agent status strip — accent-tinted so it reads as "the AI is acting". -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#1E1712" />
+    <corners android:radius="16dp" />
+    <stroke android:width="0.5dp" android:color="#FF7F2E" />
+</shape>

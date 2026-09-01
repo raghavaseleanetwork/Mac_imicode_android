@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Solid accent pill for the agent's primary action (Continue / Send). -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#FF7F2E" />
+    <corners android:radius="20dp" />
+</shape>

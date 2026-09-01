@@ -20,6 +20,8 @@ class MyApplication : Application() {
         super.onCreate()
         CONTEXT = applicationContext
         instance = this
+        // The glasses can call a browser tool before any screen has opened.
+        com.sdk.glassessdksample.ui.web.GlassBrowserEngine.init(applicationContext)
         // Install a defensive uncaught-exception handler to prevent library parsing bugs
         // from crashing the app. We only swallow specific ArrayIndexOutOfBoundsException
         // instances originating from the glasses parser to keep the app running.

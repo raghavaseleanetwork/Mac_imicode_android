@@ -407,11 +407,14 @@
                         android:tint="#66FFFFFF" />
                 </LinearLayout>
 
-                <!-- Logout -->
+                <!-- Logout: hidden along with the login screen. Set visibility back
+                     to "visible" when the login flow is re-enabled (see
+                     SplashActivity.skipAuth). -->
                 <LinearLayout
                     android:id="@+id/logoutButton"
                     android:layout_width="match_parent"
                     android:layout_height="58dp"
+                    android:visibility="gone"
                     android:orientation="horizontal"
                     android:gravity="center_vertical"
                     android:clickable="true"

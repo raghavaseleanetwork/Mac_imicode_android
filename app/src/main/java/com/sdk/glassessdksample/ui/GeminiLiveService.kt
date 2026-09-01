@@ -2036,11 +2036,15 @@ class GeminiLiveService(
         // ListeningService) has no analyze_view / capture_new_frame case, so
         // declaring them there only gets the model to call something that comes
         // back "not yet implemented" — worse than not offering them at all.
-        val tools = if (isMark2) {
+        val visionFiltered = if (isMark2) {
             allTools
         } else {
             allTools.filterNot { (it["name"] as? String) in VISION_TOOL_NAMES }
         }
+
+        // 🌐 Browser tools work on both marks — they drive an off-screen WebView
+        // on the phone, not the glasses hardware — so they are not mark-gated.
+        val tools = visionFiltered + com.sdk.glassessdksample.ui.web.GlassBrowserTools.declarations()
 
         // 👁️ Every other tool in this list has an explicit "call this when the
         // user says X" section below. Vision had none, so with the "reply FAST
@@ -2079,6 +2083,10 @@ SILENT MODE: When the user asks you to be quiet, go silent, stop talking, mute y
 SONG IDENTIFICATION: When the user asks what song or music is playing (in any language), call identify_song. It listens to the audio already around you, so never ask the user to replay the song or hold up the phone. Report the result naturally in one short line, like "That's Warriors by Imagine Dragons." If it comes back saying it couldn't identify the song, just say so briefly without apologising at length.
 
 EMAIL - READING: When the user asks about new emails, their inbox, or unread mail, call read_emails and tell them the result briefly.
+
+WEB BROWSER - YOU CAN USE WEBSITES: You control a real browser on the user's phone, already signed in to sites they use. When the user wants something DONE on a website rather than just answered from memory - "open my email and check", "search Amazon for headphones and tell me the price", "book a table on this site", "check the score on the cricket site" - call browse_web and put their whole request in the 'goal' parameter. To read back whatever page is open, call read_current_page. For "how far is my Claude project", "what was I doing in ChatGPT", call catch_up_on_ai.
+If a browser tool comes back saying you need the user to sign in, solve a security check, or finish something on the phone, tell them EXACTLY that in one short line and stop - do not try another way around it and never ask them for a password or a one-time code. When they say they are done ("done", "logged in", "carry on", "ho gaya"), call browser_continue.
+Browser tools take a few seconds. Say one short line like "Let me check" BEFORE calling, then report what came back.
 
 EMAIL - SENDING (always confirm first): When the user asks you to email or write to someone, call draft_email with your best guess at recipient, subject, and body from what they said. Then READ THE DRAFT BACK to the user out loud in your own next spoken turn (recipient, subject, and a short summary of the body) and ask "should I send it?". Do NOT call confirm_send_email in the same turn as draft_email. Only call confirm_send_email in a LATER turn, after the user has explicitly agreed (e.g. "yes", "send it", "go ahead"). If the user wants changes, call draft_email again with the corrected details and read it back again. If the user declines, do not send anything.
 $visionInstruction"""

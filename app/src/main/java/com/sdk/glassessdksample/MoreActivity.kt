@@ -17,6 +17,7 @@ import com.sdk.glassessdksample.ui.ConversationHistoryActivity
 import com.sdk.glassessdksample.ui.MeetingMinutesActivity
 import com.sdk.glassessdksample.ui.QuickNotesActivity
 import com.sdk.glassessdksample.ui.UserMemoryActivity
+import com.sdk.glassessdksample.ui.web.WebBrowserActivity
 import com.sdk.glassessdksample.ui.gallery.GlassMediaGalleryActivity
 import com.sdk.glassessdksample.ui.gallery.ImageDescriptionVaultActivity
 import java.io.File
@@ -45,6 +46,7 @@ class MoreActivity : AppCompatActivity() {
     private fun setupActions() {
         binding.cardCamera.setOnClickListener { open(CameraActivity::class.java) }
         binding.cardQuickNotes.setOnClickListener { open(QuickNotesActivity::class.java) }
+        binding.cardWeb.setOnClickListener { open(WebBrowserActivity::class.java) }
         binding.cardMeetingMinutes.setOnClickListener { open(MeetingMinutesActivity::class.java) }
         binding.cardConversationHistory.setOnClickListener { open(ConversationHistoryActivity::class.java) }
         binding.cardChat.setOnClickListener { open(ChatActivity::class.java) }

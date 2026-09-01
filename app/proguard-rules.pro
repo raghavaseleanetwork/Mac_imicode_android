@@ -60,3 +60,36 @@
 -keep class ai.onnxruntime.** { *; }
 -keepclassmembers class ai.onnxruntime.** { *; }
 -dontwarn ai.onnxruntime.**
+# Gson relies on generic type information that R8 strips by default. Without
+# Signature/InnerClasses the anonymous `object : TypeToken<List<Foo>>() {}`
+# subclasses lose their type argument, and Gson throws
+#   "TypeToken must be created with a type argument: new TypeToken<...>(){}"
+# the moment any saved conversation/session/memory is deserialized — which is
+# what killed starting a new AI session in release ("Failed to start: ...").
+# Debug builds never showed it because minifyEnabled is false there.
+-keepattributes Signature
+-keepattributes InnerClasses
+-keepattributes EnclosingMethod
+-keepattributes RuntimeVisibleAnnotations
+-keepattributes RuntimeVisibleParameterAnnotations
+
+-dontwarn sun.misc.**
+-keep class com.google.gson.** { *; }
+-keep class com.google.gson.reflect.TypeToken { *; }
+-keep class * extends com.google.gson.reflect.TypeToken
+-keep public class * implements java.lang.reflect.Type
+
+# Gson uses reflection to fill @SerializedName-annotated fields; without this
+# R8 renames them and every parsed model comes back with null fields.
+-keepclassmembers,allowobfuscation class * {
+    @com.google.gson.annotations.SerializedName <fields>;
+}
+-keepclassmembers enum * {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
+
+# Data/model classes that Gson serializes in the AI-session path. Keeping the
+# whole ui + root package's model members is cheaper than tracking each one.
+-keep class com.sdk.glassessdksample.ui.** { *; }
+-keep class com.sdk.glassessdksample.NotificationItem { *; }

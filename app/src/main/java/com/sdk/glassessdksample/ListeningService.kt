@@ -541,6 +541,11 @@ class ListeningService : Service() {
                 "send_message" -> bgSendMessage(args)
                 "read_emails" -> bgReadEmails()
                 "identify_song" -> bgIdentifySong()
+                // 🌐 Browser tools drive an off-screen WebView, so they work
+                // here with the app in the background — that is the point.
+                in com.sdk.glassessdksample.ui.web.GlassBrowserTools.TOOL_NAMES ->
+                    com.sdk.glassessdksample.ui.web.GlassBrowserTools
+                        .handleBlocking(this@ListeningService, toolName, args)
                 "say_goodbye" -> { endBackgroundConversation(); "Goodbye!" }
                 "mute_ai" -> { endBackgroundConversation(); "Muting now." }
                 // Genuinely need the on-screen app (camera preview, meeting UI, media UI).

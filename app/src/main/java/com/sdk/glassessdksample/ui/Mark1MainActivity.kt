@@ -1063,6 +1063,11 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
             "read_notifications" -> handleReadNotifications()
             "identify_song" -> handleIdentifySong()
             "say_goodbye" -> handleSayGoodbye()
+            // 🌐 Browser tools run against an off-screen WebView shared with
+            // the Web section, so the user's logins carry over.
+            in com.sdk.glassessdksample.ui.web.GlassBrowserTools.TOOL_NAMES ->
+                com.sdk.glassessdksample.ui.web.GlassBrowserTools
+                    .handleBlocking(this@Mark1MainActivity, toolName, args)
             else -> "Tool $toolName not yet implemented."
         }
     }

@@ -210,6 +210,14 @@
             android:exported="false"
             android:label="User AI Summary" />
 
+        <!-- WEB - IN-APP BROWSER (command control arrives in a later module) -->
+        <activity
+            android:name=".ui.web.WebBrowserActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
+            android:label="Web" />
+
         <!-- QUICK NOTES - USER NOTES AND AI REMINDERS -->
         <activity
             android:name=".ui.QuickNotesActivity"
