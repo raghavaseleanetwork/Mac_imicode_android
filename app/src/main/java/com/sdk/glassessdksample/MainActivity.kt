@@ -821,6 +821,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      * can keep running on its own, and switch back to BLE audio in onResume().
      */
     private fun handOffListeningToService() {
+        // 🎤 We are being stopped because the meeting recorder came to the front.
+        // Handing off would start ListeningService, which arms a phone-mic detector
+        // against the meeting's live MediaRecorder and kills the recording — the
+        // reason meeting minutes stopped by itself on Mark 2. Same rationale as the
+        // vision guard in onStop().
+        if (com.sdk.glassessdksample.ui.ActiveMeetingActivity.meetingActive) {
+            Log.i(TAG, "🎤 Meeting recording in progress — skipping ListeningService hand-off")
+            return
+        }
         if (!backgroundListeningEnabled || isAiMuted) {
             Log.d(TAG, "🎙️ Not handing off to ListeningService (enabled=$backgroundListeningEnabled muted=$isAiMuted)")
             return
@@ -894,7 +903,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         // We're visible again, so this Activity's glass BLE feed is live once more —
         // switch the detector back to BLE audio (onStop had flipped it to phone mic).
-        if (backgroundListeningEnabled && !isAiMuted && hasRecordAudioPermission()) {
+        if (backgroundListeningEnabled && !isAiMuted && hasRecordAudioPermission() &&
+            !com.sdk.glassessdksample.ui.ActiveMeetingActivity.meetingActive) {
             try {
                 HotHelper.getInstance(applicationContext).apply {
                     stop()

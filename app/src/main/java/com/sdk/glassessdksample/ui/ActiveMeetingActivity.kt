@@ -11,10 +11,12 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.PowerManager
 import android.os.Looper
 import android.media.MediaRecorder
 import android.util.Log
 import android.view.View
+import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
@@ -82,16 +84,26 @@ class ActiveMeetingActivity : AppCompatActivity() {
     private var currentMeeting: MeetingMinute? = null
     private var isRecording = false
     private var isPaused = false
+
+    // Total time spent paused, and when the current pause began, so the displayed
+    // duration reflects recorded audio rather than raw wall-clock time.
+    private var pausedDurationMs = 0L
+    private var pauseStartedAtMs = 0L
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     
     // Audio focus management
     private lateinit var audioManager: AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
+
+    // Keeps the CPU alive so recording survives the screen turning off / doze.
+    private var wakeLock: PowerManager.WakeLock? = null
     
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_active_meeting)
+        // Recording must keep running while the user looks away from the phone.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         
         meetingManager = MeetingMinutesManager(this)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -176,6 +188,15 @@ class ActiveMeetingActivity : AppCompatActivity() {
         currentMeeting = meetingManager.startMeeting(meetingTitle)
         tvMeetingTitle.text = "Title: $meetingTitle"
         
+        // Take the microphone away from wake-word detection for the whole meeting.
+        // Without this, ListeningService re-arms the "Hey IMI" detector on a timer
+        // and its recorder kills our MediaRecorder mid-meeting.
+        acquireMicExclusively()
+
+        // A meeting runs for a long time with the screen possibly off; without a
+        // partial wake lock the CPU sleeps and the recorder is torn down.
+        acquireWakeLock()
+
         // Request audio focus
         requestAudioFocus()
         
@@ -190,6 +211,77 @@ class ActiveMeetingActivity : AppCompatActivity() {
         Log.d(TAG, "Meeting started: $meetingTitle")
     }
     
+    /**
+     * Claim the mic for the meeting: raise the global meeting flag, stop the
+     * wake-word detector and suppress every path that would re-arm it, and stop
+     * the foreground listening service that owns the background detector.
+     *
+     * setSuppressed(true) is the same mechanism vision analysis uses — HotHelper.start()
+     * becomes a no-op while it is engaged, so the delayed re-arms already queued by
+     * Mark1MainActivity.stopConversation() and ListeningService.rearmWakeWord() fire
+     * harmlessly instead of stealing the microphone.
+     */
+    private fun acquireMicExclusively() {
+        meetingActive = true
+        try {
+            HotHelper.getInstance(applicationContext).apply {
+                setSuppressed(true)
+                stop()
+            }
+            Log.d(TAG, "Wake-word detection suppressed for meeting")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not suppress wake word: ${e.message}")
+        }
+        try {
+            startService(
+                Intent(this, com.sdk.glassessdksample.ListeningService::class.java)
+                    .apply { action = com.sdk.glassessdksample.ListeningService.ACTION_STOP }
+            )
+            Log.d(TAG, "ListeningService stopped for meeting")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not stop ListeningService: ${e.message}")
+        }
+    }
+
+    /**
+     * Release the exclusive mic claim taken by [acquireMicExclusively]. Safe to call
+     * more than once. Deliberately does NOT restart the detector itself — the host
+     * Activity's onResume re-arms it, matching how vision suppression is released.
+     */
+    private fun releaseMicExclusively() {
+        if (!meetingActive) return
+        meetingActive = false
+        try {
+            HotHelper.getInstance(applicationContext).setSuppressed(false)
+            Log.d(TAG, "Wake-word suppression released after meeting")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not release wake-word suppression: ${e.message}")
+        }
+    }
+
+    private fun acquireWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) return
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "IMI:MeetingRecording"
+            ).apply { setReferenceCounted(false); acquire() }
+            Log.d(TAG, "Wake lock acquired for meeting recording")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not acquire wake lock: ${e.message}")
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+            wakeLock = null
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not release wake lock: ${e.message}")
+        }
+    }
+
     private fun requestAudioFocus() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
@@ -238,6 +330,16 @@ class ActiveMeetingActivity : AppCompatActivity() {
             }
 
             mediaRecorder?.apply {
+                // Surface a recorder that dies mid-meeting instead of letting the UI
+                // keep ticking against a dead recorder — the user only found out at
+                // the end, when the meeting had captured nothing.
+                setOnErrorListener { _, what, extra ->
+                    Log.e(TAG, "MediaRecorder error what=$what extra=$extra")
+                    runOnUiThread { handleRecorderFailure("Recording error ($what)") }
+                }
+                setOnInfoListener { _, what, extra ->
+                    Log.w(TAG, "MediaRecorder info what=$what extra=$extra")
+                }
                 setAudioSource(MediaRecorder.AudioSource.MIC)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
@@ -250,6 +352,8 @@ class ActiveMeetingActivity : AppCompatActivity() {
             
             isRecording = true
             isPaused = false
+            pausedDurationMs = 0L
+            pauseStartedAtMs = 0L
 
             tvStatus.text = "Recording audio"
             indicatorRecording.visibility = View.VISIBLE
@@ -261,9 +365,38 @@ class ActiveMeetingActivity : AppCompatActivity() {
 
             Log.d(TAG, "Audio recording started: $audioFilePath")
         } catch (e: Exception) {
+            // Do NOT leave isRecording true here: the timer would keep counting and
+            // the meeting would look like it was recording when it never started.
+            isRecording = false
+            isPaused = false
+            try { mediaRecorder?.release() } catch (_: Exception) {}
+            mediaRecorder = null
+            audioFilePath = null
             Log.e(TAG, "Error starting audio recording: ${e.message}", e)
+            tvStatus.text = "Recording failed"
+            indicatorRecording.visibility = View.GONE
             Toast.makeText(this, "Error starting recording: ${e.message}", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    /**
+     * The recorder stopped on its own (mic taken by another app, hardware error).
+     * Stop the clock, tell the user, and keep whatever audio was written so the
+     * meeting can still be transcribed rather than silently lost.
+     */
+    private fun handleRecorderFailure(reason: String) {
+        if (!isRecording) return
+        Log.e(TAG, "Recorder failure: $reason")
+        isRecording = false
+        handler.removeCallbacks(durationRunnable)
+        handler.removeCallbacks(amplitudeRunnable)
+        try { mediaRecorder?.release() } catch (_: Exception) {}
+        mediaRecorder = null
+        tvStatus.text = "Recording stopped"
+        indicatorRecording.visibility = View.GONE
+        blobGlow.setAmplitude(0f)
+        glowBg.setAmplitude(0f)
+        Toast.makeText(this, "$reason - finishing meeting", Toast.LENGTH_LONG).show()
     }
     
     private fun pauseRecording() {
@@ -272,6 +405,7 @@ class ActiveMeetingActivity : AppCompatActivity() {
             try {
                 mediaRecorder?.pause()
                 isPaused = true
+                pauseStartedAtMs = System.currentTimeMillis()
                 tvStatus.text = "Paused"
                 indicatorRecording.visibility = View.GONE
                 blobGlow.setAmplitude(0f)
@@ -292,6 +426,10 @@ class ActiveMeetingActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             try {
                 mediaRecorder?.resume()
+                if (pauseStartedAtMs > 0L) {
+                    pausedDurationMs += System.currentTimeMillis() - pauseStartedAtMs
+                    pauseStartedAtMs = 0L
+                }
                 isPaused = false
                 tvStatus.text = "Recording audio"
                 indicatorRecording.visibility = View.VISIBLE
@@ -330,6 +468,8 @@ class ActiveMeetingActivity : AppCompatActivity() {
             Log.e(TAG, "Error stopping recorder: ${e.message}")
         }
         abandonAudioFocus()
+        releaseMicExclusively()
+        releaseWakeLock()
         handler.removeCallbacksAndMessages(null)
 
         // Switch from the recording timer to the summary-generation view (mockup screen 5)
@@ -493,24 +633,38 @@ class ActiveMeetingActivity : AppCompatActivity() {
         cardSummaryResult.visibility = View.VISIBLE
     }
     
-    private fun startDurationTimer() {
-        handler.postDelayed(object : Runnable {
-            override fun run() {
-                updateDuration()
-                handler.postDelayed(this, 1000) // Update every second
-            }
-        }, 1000)
+    /**
+     * Drives the on-screen timer. Uses a single dedicated Runnable reference so the
+     * chain can never be scheduled twice and can be cancelled precisely on end.
+     */
+    private val durationRunnable = object : Runnable {
+        override fun run() {
+            updateDuration()
+            handler.postDelayed(this, 1000) // Update every second
+        }
     }
-    
+
+    private fun startDurationTimer() {
+        handler.removeCallbacks(durationRunnable)
+        handler.postDelayed(durationRunnable, 1000)
+    }
+
     private fun updateDuration() {
+        if (!isRecording) return
         currentMeeting?.let { meeting ->
-            val durationMs = System.currentTimeMillis() - meeting.startTime
+            // Exclude paused time so the clock matches the audio actually captured.
+            // This used to be raw wall-clock from startTime, so the timer kept
+            // counting while paused and drifted away from the real recording.
+            val pausedSoFar = pausedDurationMs +
+                if (isPaused && pauseStartedAtMs > 0L) System.currentTimeMillis() - pauseStartedAtMs else 0L
+            val durationMs = (System.currentTimeMillis() - meeting.startTime - pausedSoFar)
+                .coerceAtLeast(0L)
             val minutes = (durationMs / 1000 / 60).toInt()
             val seconds = ((durationMs / 1000) % 60).toInt()
             tvDuration.text = String.format("%02d :\n%02d", minutes, seconds)
         }
     }
-    
+
     private fun updateLiveParticipantsDisplay(speakerCount: Int) {
         if (speakerCount > 0) {
             tvLiveParticipants.visibility = View.VISIBLE
@@ -537,6 +691,8 @@ class ActiveMeetingActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         abandonAudioFocus()
+        releaseMicExclusively()
+        releaseWakeLock()
         try {
             mediaRecorder?.release()
         } catch (e: Exception) {
@@ -549,5 +705,21 @@ class ActiveMeetingActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_MEETING_TITLE = "meeting_title"
         private const val REQUEST_RECORD_AUDIO = 300
+
+        /**
+         * True while a meeting recording is in progress.
+         *
+         * The meeting recorder owns the microphone exclusively for as long as the
+         * meeting runs, which can be hours. Every wake-word re-arm path in the app
+         * (ListeningService.rearmWakeWord / onStartCommand, MainActivity.onResume +
+         * handOffListeningToService, Mark1MainActivity.startWakeWordListeningDelayed)
+         * must check this before starting a detector: arming a second recorder against
+         * the live MediaRecorder kills it silently on most devices, which is what made
+         * the meeting timer freeze and recording stop part-way through.
+         *
+         * Mirrors the existing MainActivity.visionBusy suppression flag.
+         */
+        @Volatile
+        var meetingActive = false
     }
 }

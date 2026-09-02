@@ -47,9 +47,9 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
 
     companion object {
         private const val TAG = "Mark1MainActivity"
-        private const val PREF_VOICE_MODE = "voice_mode"
-        private const val VOICE_MODE_SEAMLESS = "seamless"
-        private const val VOICE_MODE_SINGLE_SHOT = "single_shot"
+        // Shared with MainActivity (Mark 2) and the Settings switch. The old
+        // "voice_mode" string this replaced was never written by anything.
+        private const val PREF_CONTINUOUS_CHAT = "continuous_chat"
         private const val REQUEST_PERMISSIONS = 1001
         private const val PREFS_CONVERSATION = "mark1_conversation"
         private const val KEY_HISTORY = "conversation_history"
@@ -77,6 +77,12 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
 
     private var isGeminiLiveActive = false
     private var wakeWordStarted = false
+
+    // 🔂 Continuous Chat OFF: close the session once the single reply has been
+    // spoken in full, with a timer as the backstop.
+    private var endSessionAfterPlayback = false
+    private var endSessionFallback: Runnable? = null
+    private var conversationModeCommandHandled = false
     private var isAiMuted = false
     // Set by onNewIntent() when the wake word brought this Activity to the foreground,
     // so the next onResume() doesn't re-run the BLE gate and stomp on the conversation
@@ -209,9 +215,19 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     private fun maybeStartPendingWakeConversation() {
         if (!pendingWakeConversation) return
         pendingWakeConversation = false
-        if (isAiMuted || isGeminiLiveActive) return
+        // 🎤 ListeningService disarmed the detector the moment "Hey IMI" fired,
+        // expecting us to take the mic. Every bail-out below must therefore put the
+        // wake word back, or IMI goes permanently deaf until the app is reopened —
+        // which is exactly the "sometimes it never listens to me" symptom.
+        if (isAiMuted || isGeminiLiveActive) {
+            Log.i(TAG, "Wake conversation declined (muted=$isAiMuted active=$isGeminiLiveActive) — re-arming")
+            requestWakeWordRearm()
+            return
+        }
         if (!isGlassConnected()) {
             // No glasses → assistant is gated off; show the gate instead.
+            Log.i(TAG, "Wake conversation declined (glasses not connected) — re-arming")
+            requestWakeWordRearm()
             checkBleAndShowGate()
             return
         }
@@ -496,6 +512,27 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
      * (worse now that the Mark 1 threshold is lowered). The delay lets the
      * audio environment settle before we start scoring frames again.
      */
+    /**
+     * Ask ListeningService to re-arm wake-word detection.
+     *
+     * Needed whenever a wake word was consumed but no conversation started: the
+     * service disarms the detector on detection and nothing else will turn it
+     * back on, so without this "Hey IMI" stops working until the app restarts.
+     */
+    private fun requestWakeWordRearm() {
+        if (isAiMuted) return
+        try {
+            startService(
+                Intent(this, ListeningService::class.java)
+                    .apply { action = ListeningService.ACTION_REARM_WAKE_WORD }
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not request wake-word re-arm: ${e.message}")
+            // Fall back to the local path so we still recover.
+            startWakeWordListeningDelayed()
+        }
+    }
+
     private fun startWakeWordListeningDelayed(delayMs: Long = 1_200L) {
         wakeWordHandler.removeCallbacksAndMessages(null)
         wakeWordHandler.postDelayed({
@@ -508,6 +545,13 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     private fun startWakeWordListening() {
         // Cancel any pending delayed re-arm so we don't double-start.
         wakeWordHandler.removeCallbacksAndMessages(null)
+        // 🎤 stopConversation() queues a delayed re-arm and then launches the meeting
+        // screen. Without this guard that re-arm fires a second later and grabs the
+        // mic from the recorder — why Mark 1 stopped after only a few seconds.
+        if (ActiveMeetingActivity.meetingActive) {
+            Log.i(TAG, "🎤 Meeting recording in progress — not starting wake word")
+            return
+        }
         if (isAiMuted || wakeWordStarted) return
         wakeWordStarted = true
 
@@ -566,8 +610,14 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         val startOnce = {
             if (started.compareAndSet(false, true)) startInlineGeminiLive()
         }
-        // Backstop: if the chime hasn't handed off within 1.2s, start anyway.
+        // Backstop: if the chime never plays at all, start anyway.
         Handler(Looper.getMainLooper()).postDelayed({ startOnce() }, 1_200)
+
+        // Release the PREVIOUS chime BEFORE building the new one. This used to run
+        // after start(), so a second wake word released a player that was still
+        // sounding — the chime cut out or never played at all.
+        try { wakeChimePlayer?.release() } catch (_: Exception) {}
+        wakeChimePlayer = null
 
         try {
             val mp = MediaPlayer().apply {
@@ -577,24 +627,30 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
                         .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
                         .build()
                 )
-                val afd = resources.openRawResourceFd(R.raw.wake_chime)
-                setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-                afd.close()
+                resources.openRawResourceFd(R.raw.wake_chime).use { afd ->
+                    setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                }
                 setVolume(1f, 1f)
                 setOnCompletionListener { player ->
-                    player.release()
-                    startOnce()
+                    try { player.release() } catch (_: Exception) {}
+                    if (wakeChimePlayer === player) wakeChimePlayer = null
                 }
-                setOnErrorListener { player, _, _ ->
-                    player.release()
+                setOnErrorListener { player, what, extra ->
+                    Log.w(TAG, "Wake chime error what=$what extra=$extra")
+                    try { player.release() } catch (_: Exception) {}
+                    if (wakeChimePlayer === player) wakeChimePlayer = null
                     startOnce()
                     true
                 }
                 prepare()
                 start()
             }
-            wakeChimePlayer?.release()
             wakeChimePlayer = mp
+            // Connect IN PARALLEL with the chime rather than waiting for it to
+            // finish. The chime is ~1s and socket/SCO setup doesn't need the
+            // speaker, so waiting just added a second of dead air before IMI
+            // could listen. Matches Mark 2's wake behaviour.
+            startOnce()
         } catch (e: Exception) {
             Log.w(TAG, "Chime failed: ${e.message}")
             startOnce()
@@ -626,11 +682,17 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
             startPulseAnimation()
         }
 
-        geminiLiveService?.startLiveConversation(systemInstruction, greetOnStart = true)
+        // 🔂 Greet only in Continuous Chat mode. With it OFF the session ends
+        // after ONE reply, so a spoken "Hi, how can I help?" would burn that single
+        // reply before the user has even asked anything. Matches Mark 2.
+        val greetOnWake = !isSingleShotMode()
+        geminiLiveService?.startLiveConversation(systemInstruction, greetOnStart = greetOnWake)
     }
 
     private fun stopConversation() {
         isGeminiLiveActive = false
+        cancelPendingSessionEnd()
+        conversationModeCommandHandled = false
         // End the current session so the next conversation is grouped separately.
         currentSessionId = null
         geminiLiveService?.stopLiveConversation()
@@ -1027,6 +1089,22 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         }
 
         if (isFinal && input.isNotBlank()) {
+            // 🔂 "turn on/off conversation mode" — handled before the text is
+            // treated as a normal question, same as Mark 2.
+            if (handleConversationModeCommand(input)) {
+                val nowOn = getSharedPreferences("imi_prefs", Context.MODE_PRIVATE)
+                    .getBoolean(
+                        PREF_CONTINUOUS_CHAT,
+                        com.sdk.glassessdksample.MainActivity.CONTINUOUS_CHAT_DEFAULT
+                    )
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        if (nowOn) "Conversation mode on" else "Conversation mode off",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
             userMemoryManager.learnFromUserMessage(input)
             userMemoryManager.incrementMessageStats(false)
         }
@@ -1040,9 +1118,16 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
             sessionId = currentSessionId
         )
 
-        if (isSingleShotMode()) {
-            runOnUiThread { stopConversation() }
+        // 🔂 Continuous Chat off: end the session once this reply has finished
+        // PLAYING, not right now — stopping here cut the answer off mid-sentence.
+        // The isNotEmpty guard stops an empty/greeting turn consuming the one reply.
+        if (isSingleShotMode() && fullInput.isNotBlank()) {
+            Log.d(TAG, "🔂 Continuous Chat off - ending session once this reply finishes playing")
+            runOnUiThread { endSessionAfterCurrentReply("Continuous Chat off") }
         }
+
+        // Reset the per-utterance latch so the next turn can be a mode command.
+        conversationModeCommandHandled = false
     }
 
     override fun onToolCall(toolName: String, args: Map<String, Any>): String {
@@ -1081,6 +1166,16 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     override fun onAudioPlaybackEnd() {
         runOnUiThread {
             if (isGeminiLiveActive) binding.tvConversationStatus.text = "🎤 Listening…"
+
+            // 🔂 Continuous Chat off: the single reply has now been spoken in
+            // full, so close the session and go back to waiting for "Hey IMI".
+            if (endSessionAfterPlayback) {
+                endSessionAfterPlayback = false
+                endSessionFallback?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+                endSessionFallback = null
+                Log.d(TAG, "🔂 Continuous Chat off - reply finished, stopping AI until next wake word")
+                stopConversation()
+            }
         }
     }
 
@@ -1366,9 +1461,103 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     // HELPERS
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * True when the session should close after a single reply, i.e. Continuous
+     * Chat is OFF.
+     *
+     * Reads the same "continuous_chat" pref that the Settings switch writes and
+     * that Mark 2 uses. This used to read a legacy "voice_mode" string that
+     * nothing in the app ever wrote, so it always returned false and Mark 1 was
+     * stuck in continuous mode with the Settings toggle doing nothing.
+     */
     private fun isSingleShotMode(): Boolean {
         val prefs = getSharedPreferences("imi_prefs", Context.MODE_PRIVATE)
-        return prefs.getString(PREF_VOICE_MODE, VOICE_MODE_SEAMLESS) == VOICE_MODE_SINGLE_SHOT
+        return !prefs.getBoolean(
+            PREF_CONTINUOUS_CHAT,
+            com.sdk.glassessdksample.MainActivity.CONTINUOUS_CHAT_DEFAULT
+        )
+    }
+
+    /**
+     * Clears the "close the session after this reply" state, so the live session
+     * stays open. Mirrors MainActivity.cancelPendingSessionEnd.
+     */
+    private fun cancelPendingSessionEnd() {
+        endSessionAfterPlayback = false
+        endSessionFallback?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        endSessionFallback = null
+    }
+
+    /**
+     * Arms the single-reply shutdown: the session closes as soon as the current
+     * reply finishes playing, so we fall back to "Hey IMI".
+     *
+     * onAudioPlaybackEnd() is the normal path; the posted task is the backstop for
+     * when that callback never arrives (a text-only reply that queues no audio).
+     * Mirrors MainActivity.endSessionAfterCurrentReply.
+     */
+    private fun endSessionAfterCurrentReply(reason: String) {
+        endSessionAfterPlayback = true
+        endSessionFallback?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        val fallback = Runnable {
+            if (endSessionAfterPlayback) {
+                endSessionAfterPlayback = false
+                endSessionFallback = null
+                Log.d(TAG, "🔂 $reason - playback-end never arrived, force-stopping AI")
+                stopConversation()
+            }
+        }
+        endSessionFallback = fallback
+        Handler(Looper.getMainLooper()).postDelayed(fallback, 10_000)
+    }
+
+    /**
+     * 🔂 Voice control for Continuous Chat ("turn on/off conversation mode").
+     * Returns true if [spoken] was a conversation-mode command, so the caller
+     * stops treating it as a normal question. Ported from MainActivity.
+     */
+    private fun handleConversationModeCommand(spoken: String): Boolean {
+        val cmd = spoken.lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        val mentionsMode = cmd.contains("conversation mode") ||
+            cmd.contains("conversational mode") ||
+            cmd.contains("conversion mode") ||
+            cmd.contains("continuous chat") ||
+            cmd.contains("continuous mode") ||
+            cmd.contains("conversation chat")
+        if (!mentionsMode) return false
+
+        // Whole-word matching so "on" isn't found inside "c-on-versation".
+        fun hasWord(vararg words: String) =
+            words.any { Regex("\\b${Regex.escape(it)}\\b").containsMatchIn(cmd) }
+
+        val wantsOff = hasWord("off", "stop", "disable", "end", "exit", "band", "close")
+        val wantsOn = hasWord("on", "start", "enable", "begin", "chalu", "shuru", "open")
+
+        // The transcript streams in growing chunks, so act once per utterance.
+        if (conversationModeCommandHandled) return true
+        conversationModeCommandHandled = true
+
+        val prefs = getSharedPreferences("imi_prefs", Context.MODE_PRIVATE)
+        val current = prefs.getBoolean(
+            PREF_CONTINUOUS_CHAT,
+            com.sdk.glassessdksample.MainActivity.CONTINUOUS_CHAT_DEFAULT
+        )
+        // "off" first: "turn off conversation mode" contains "on" inside the word.
+        val enable = when {
+            wantsOff -> false
+            wantsOn -> true
+            else -> !current
+        }
+
+        prefs.edit().putBoolean(PREF_CONTINUOUS_CHAT, enable).apply()
+        Log.d(TAG, "🔂 Conversation mode set by voice: $enable (from '$spoken')")
+
+        if (enable) cancelPendingSessionEnd()
+        return true
     }
 
     private fun checkAndRequestPermissions() {
