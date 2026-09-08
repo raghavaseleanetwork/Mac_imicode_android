@@ -14,8 +14,15 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.appcompat.app.AppCompatActivity
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class LetUsKnowYouActivity : AppCompatActivity() {
+
+    companion object {
+        // Kept in sync with `questions` below so callers (e.g. the home screen's
+        // "Let Us Know You" subtitle) never have to hardcode this count themselves.
+        const val QUESTION_COUNT = 7
+    }
 
     private data class ProfileQuestion(val prompt: String)
 
@@ -64,6 +71,7 @@ class LetUsKnowYouActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_let_us_know_you)
+        SystemBarsInsets.apply(this)
 
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         supportActionBar?.title = "Let Us Know You"

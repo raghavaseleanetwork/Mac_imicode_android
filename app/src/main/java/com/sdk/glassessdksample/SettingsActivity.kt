@@ -23,6 +23,7 @@ import com.sdk.glassessdksample.ui.ModelProvider
 import com.sdk.glassessdksample.ui.UsageLimitManager
 import com.sdk.glassessdksample.wakeword.WakeWordEngine
 import com.sdk.glassessdksample.wakeword.WakeWordEngineSettings
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class SettingsActivity : AppCompatActivity() {
 
@@ -45,6 +46,7 @@ class SettingsActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivitySettingsBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
 
         gmailService = GmailService(this)
         setupSettings()

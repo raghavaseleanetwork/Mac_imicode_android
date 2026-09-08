@@ -16,6 +16,7 @@ import androidx.core.content.FileProvider
 import com.sdk.glassessdksample.R
 import java.io.File
 import kotlin.math.abs
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Full-screen image viewer for Glass Gallery images
@@ -62,6 +63,7 @@ class ImageViewerActivity : AppCompatActivity() {
         )
         
         setContentView(R.layout.activity_image_viewer)
+        SystemBarsInsets.apply(this, fullscreen = true)
         
         imageView = findViewById(R.id.fullscreenImageView)
         closeButton = findViewById(R.id.btnClose)

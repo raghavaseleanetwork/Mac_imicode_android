@@ -13,6 +13,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Activity for viewing and managing Meeting Minutes
@@ -30,6 +31,7 @@ class MeetingMinutesActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_meeting_minutes)
+        SystemBarsInsets.apply(this)
 
         meetingManager = MeetingMinutesManager(this)
 

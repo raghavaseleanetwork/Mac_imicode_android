@@ -34,6 +34,7 @@ import androidx.core.content.ContextCompat
 import org.greenrobot.eventbus.EventBus
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
+import com.sdk.glassessdksample.utils.WakeChimePlayer
 
 class ListeningService : Service() {
     companion object {
@@ -111,7 +112,6 @@ class ListeningService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var chimePlayer: MediaPlayer? = null
     private var bgGeminiService: GeminiLiveService? = null
 
     // Single-reply mode (Continuous Chat OFF): set once the AI has answered a real
@@ -159,6 +159,11 @@ class ListeningService : Service() {
                 "HeyIMI::ListeningWakeLock"
             )
             wakeLock?.acquire()
+
+        // Decode the wake chime up front. SoundPool loads asynchronously, and a
+        // cold decode on the first "Hey IMI" was one reason that first chime was
+        // routinely missed.
+        WakeChimePlayer.preload(this)
 
             // Subscribe to wake word events so we can forward them to MainActivity even
             // when the Activity is stopped (minimised / screen off).
@@ -268,8 +273,9 @@ class ListeningService : Service() {
         try { bgGeminiService?.stopLiveConversation() } catch (_: Exception) {}
         bgGeminiService = null
         bgConversationActive = false
-        chimePlayer?.release()
-        chimePlayer = null
+        // The wake chime is a shared, preloaded sample owned by WakeChimePlayer and
+        // used by the Activities too, so it is deliberately NOT released here —
+        // tearing it down with this service would silence their wake sound.
     }
 
     /**
@@ -466,53 +472,22 @@ class ListeningService : Service() {
         }, REARM_DELAY_MS)
     }
 
-    /** Plays the wake chime through the current audio route, then invokes [then]. */
+    /**
+     * Plays the wake chime through the current audio route, then invokes [then].
+     *
+     * Delegates to [WakeChimePlayer] so all three wake paths (Mark 1, Mark 2 and
+     * this service) use one implementation. The MediaPlayer this replaced opened a
+     * fresh USAGE_ASSISTANCE_SONIFICATION output against the MODE_IN_COMMUNICATION
+     * session already holding SCO for the glasses mic; with A2DP suspended for the
+     * life of that link the playback was accepted but rendered to a suspended path,
+     * leaving the chime silent on many phones with nothing logged.
+     *
+     * waitForChime = true: unlike the in-app paths, the conversation must NOT start
+     * until the chime has finished here, or the chime is fed straight into the live
+     * mic that this service opens.
+     */
     private fun playWakeChime(then: () -> Unit) {
-        val fired = java.util.concurrent.atomic.AtomicBoolean(false)
-        val once = { if (fired.compareAndSet(false, true)) then() }
-        // Backstop so a failed chime can never swallow the conversation start. Must
-        // stay LONGER than the chime itself, or it fires every time and the session
-        // starts while the chime is still sounding — feeding the chime straight into
-        // the live mic. It was 1_200 against a ~1s chime; wake_chime.wav is 2_350.
-        mainHandler.postDelayed({ once() }, CHIME_DURATION_MS + 250)
-        // Release the PREVIOUS player before building the new one. This used to run
-        // after start(), so a rapid second wake word tore down a player that was
-        // still sounding — one cause of the chime cutting out or not playing.
-        try { chimePlayer?.release() } catch (_: Exception) {}
-        chimePlayer = null
-
-        try {
-            val mp = MediaPlayer().apply {
-                setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .build()
-                )
-                resources.openRawResourceFd(R.raw.wake_chime).use { afd ->
-                    setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-                }
-                setVolume(1f, 1f)
-                setOnCompletionListener { p ->
-                    try { p.release() } catch (_: Exception) {}
-                    if (chimePlayer === p) chimePlayer = null
-                    once()
-                }
-                setOnErrorListener { p, what, extra ->
-                    Log.w(TAG, "Wake chime error what=$what extra=$extra")
-                    try { p.release() } catch (_: Exception) {}
-                    if (chimePlayer === p) chimePlayer = null
-                    once()
-                    true
-                }
-                prepare()
-                start()
-            }
-            chimePlayer = mp
-        } catch (e: Exception) {
-            Log.w(TAG, "Background chime failed: ${e.message}")
-            once()
-        }
+        WakeChimePlayer.play(this, waitForChime = true, then = then)
     }
 
     /** Minimal user/notes context so the background AI behaves like the in-app one. */

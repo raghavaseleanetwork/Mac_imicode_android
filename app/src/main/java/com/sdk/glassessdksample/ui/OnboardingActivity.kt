@@ -7,6 +7,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.viewpager2.widget.ViewPager2
 import com.sdk.glassessdksample.R
 import com.sdk.glassessdksample.databinding.ActivityOnboardingBinding
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class OnboardingActivity : AppCompatActivity() {
     
@@ -35,6 +36,7 @@ class OnboardingActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityOnboardingBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
         
         setupViewPager()
         setupButtons()

@@ -25,6 +25,18 @@
             android:paddingTop="24dp"
             android:paddingBottom="20dp">
 
+            <!-- Shown only while two Bluetooth audio devices are connected at once
+                 (see MultipleBluetoothBanner). Warns the user and locks quick-start
+                 until the other device is disconnected, since Android cannot
+                 guarantee audio routes to the glasses in that state. -->
+            <include
+                android:id="@+id/multiBluetoothBanner"
+                layout="@layout/view_multi_bluetooth_banner"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="16dp"
+                android:visibility="gone" />
+
             <!-- HEADER ROW -->
             <LinearLayout
                 android:layout_width="match_parent"
@@ -277,7 +289,7 @@
                                 android:id="@+id/tvDeviceBatteryTime"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
-                                android:text="2h 31 min"
+                                android:text="--"
                                 android:textColor="#D8D8D8"
                                 android:textSize="18sp"
                                 android:textStyle="bold" />

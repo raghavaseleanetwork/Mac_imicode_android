@@ -14,6 +14,7 @@ import com.sdk.glassessdksample.R
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class UserProfileSummaryActivity : AppCompatActivity() {
 
@@ -24,6 +25,7 @@ class UserProfileSummaryActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_user_profile_summary)
+        SystemBarsInsets.apply(this)
 
         tvSnapshot = findViewById(R.id.tvSnapshot)
         tvSummary = findViewById(R.id.tvSummary)

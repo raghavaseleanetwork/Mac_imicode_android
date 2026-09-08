@@ -24,6 +24,7 @@ import com.sdk.glassessdksample.ui.QuickNotesManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * The **Web** section — a full browser that lives inside the app, which the
@@ -77,6 +78,7 @@ class WebBrowserActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityWebBrowserBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
 
         setupWebView()
         setupAddressBar()

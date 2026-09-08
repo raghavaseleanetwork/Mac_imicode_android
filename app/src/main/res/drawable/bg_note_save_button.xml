@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Filled accent pill for the explicit Save action in the note editor.
+     Deliberately solid rather than an outline, so it reads as the primary,
+     unambiguous "this keeps your note" affordance next to the back/share icons. -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#33000000">
+    <item>
+        <shape>
+            <solid android:color="#FF7F2E" />
+            <corners android:radius="18dp" />
+        </shape>
+    </item>
+</ripple>

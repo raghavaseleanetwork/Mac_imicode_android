@@ -19,6 +19,7 @@ import com.sdk.glassessdksample.ui.DeviceType
 import com.sdk.glassessdksample.ui.Mark1BottomNavManager
 import com.sdk.glassessdksample.ui.UsageLimitManager
 import com.sdk.glassessdksample.ui.UserMemoryActivity
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class ProfileActivity : AppCompatActivity() {
 
@@ -29,6 +30,7 @@ class ProfileActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityProfileBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
 
         sharedPref = getSharedPreferences("user_prefs", MODE_PRIVATE)
 
@@ -191,7 +193,8 @@ class ProfileActivity : AppCompatActivity() {
         val userName = session.userName?.takeIf { it.isNotBlank() }
             ?: sharedPref.getString("user_name", "User") ?: "User"
         val userEmail = session.userEmail?.takeIf { it.isNotBlank() }
-            ?: sharedPref.getString("user_email", "user@example.com") ?: "user@example.com"
+            ?: sharedPref.getString("user_email", "")?.takeIf { it.isNotBlank() }
+            ?: "No email on file"
         val profileImageUrl = session.profileImageUrl?.takeIf { it.isNotBlank() }
             ?: sharedPref.getString("profile_image_url", "") ?: ""
 
@@ -240,9 +243,9 @@ class ProfileActivity : AppCompatActivity() {
 
     private fun getVersionName(): String {
         return try {
-            packageManager.getPackageInfo(packageName, 0).versionName ?: "2.0.1"
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown"
         } catch (e: Exception) {
-            "2.0.1"
+            "unknown"
         }
     }
 

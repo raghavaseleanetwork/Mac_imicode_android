@@ -6,6 +6,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.sdk.glassessdksample.auth.AuthApi
 import com.sdk.glassessdksample.databinding.ActivitySignUpBinding
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class SignUpActivity : AppCompatActivity() {
 
@@ -17,6 +18,7 @@ class SignUpActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivitySignUpBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
 
         setupUI()
     }

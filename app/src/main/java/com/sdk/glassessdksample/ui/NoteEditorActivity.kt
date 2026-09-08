@@ -4,14 +4,30 @@ import android.content.Intent
 import android.os.Bundle
 import android.widget.EditText
 import android.widget.ImageView
+import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Full-screen editor for creating and editing a Quick Note (mockup screen 1).
- * Text-only: a title field and a multi-line body. The note is saved automatically
- * when the user navigates back, as long as there is some content.
+ * Text-only: a title field and a multi-line body.
+ *
+ * Saving is two-layered:
+ *  - an explicit Save button in the header, so there is always a visible,
+ *    unambiguous way to confirm the note is kept;
+ *  - back navigation (arrow tap, system back, or the predictive-back gesture)
+ *    also saves, as a safety net for anyone who edits and just leaves.
+ *
+ * The explicit button used to be missing entirely - saving only ever happened via
+ * the deprecated Activity.onBackPressed() override, which is not guaranteed to
+ * run under predictive back (the default gesture-nav behaviour once an app
+ * targets SDK 33+): the system can complete the back animation and finish the
+ * Activity without ever calling that override, silently discarding the note.
+ * OnBackPressedCallback is registered with the dispatcher instead, which
+ * predictive back is required to invoke.
  */
 class NoteEditorActivity : AppCompatActivity() {
 
@@ -24,6 +40,7 @@ class NoteEditorActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_note_editor)
+        SystemBarsInsets.apply(this)
 
         notesManager = QuickNotesManager(this)
 
@@ -38,6 +55,15 @@ class NoteEditorActivity : AppCompatActivity() {
 
         findViewById<ImageView>(R.id.btn_back).setOnClickListener { saveAndFinish() }
         findViewById<ImageView>(R.id.btn_share).setOnClickListener { shareNote() }
+        findViewById<TextView>(R.id.btn_save).setOnClickListener { saveAndFinish() }
+
+        // Registered with the dispatcher rather than overriding the deprecated
+        // Activity.onBackPressed() — see class doc for why that matters here.
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                saveAndFinish()
+            }
+        })
     }
 
     private fun shareNote() {
@@ -76,11 +102,6 @@ class NoteEditorActivity : AppCompatActivity() {
             Toast.makeText(this, "Note saved", Toast.LENGTH_SHORT).show()
         }
         finish()
-    }
-
-    @Suppress("DEPRECATION")
-    override fun onBackPressed() {
-        saveAndFinish()
     }
 
     companion object {

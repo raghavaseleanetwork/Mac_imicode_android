@@ -5,7 +5,13 @@
     android:layout_height="match_parent"
     android:background="@drawable/mm_bg_gradient">
 
-    <!-- Header: back arrow + title + share -->
+    <!-- Header: back arrow + title + share + save.
+         Save used to be implicit (triggered only from the back arrow / system
+         back), which left users typing a note with no visible way to confirm it
+         was kept - and predictive back (Android 13+, default once the app targets
+         33+) can bypass a deprecated onBackPressed() override entirely, so the
+         gesture path was not guaranteed to save at all. An explicit button fixes
+         both: it is always visible, and it does not depend on any back callback. -->
     <LinearLayout
         android:id="@+id/header"
         android:layout_width="match_parent"
@@ -41,11 +47,25 @@
             android:id="@+id/btn_share"
             android:layout_width="34dp"
             android:layout_height="34dp"
+            android:layout_marginEnd="4dp"
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="Share"
             android:padding="6dp"
             android:src="@drawable/ic_share"
             app:tint="#FFFFFF" />
+
+        <TextView
+            android:id="@+id/btn_save"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_note_save_button"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="8dp"
+            android:text="Save"
+            android:textAllCaps="false"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:textStyle="bold" />
 
     </LinearLayout>
 

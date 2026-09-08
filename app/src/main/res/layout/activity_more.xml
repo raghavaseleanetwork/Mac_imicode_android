@@ -42,7 +42,9 @@
                 android:layout_marginBottom="28dp" />
 
             <!-- ============ YOUR RECENTS LABEL ============ -->
+            <!-- Hidden on Mark 1 (no camera hardware); see MoreActivity.applyDeviceGating() -->
             <LinearLayout
+                android:id="@+id/layoutRecentsLabel"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
@@ -65,7 +67,10 @@
             </LinearLayout>
 
             <!-- ============ RECENTS CARD (Figma: 356x243, radius 20) ============ -->
+            <!-- Hidden on Mark 1: contains Live Gallery, Camera and Vision Chat,
+                 all of which need the camera hardware that Mark 1 doesn't have. -->
             <LinearLayout
+                android:id="@+id/layoutRecentsCard"
                 android:layout_width="match_parent"
                 android:layout_height="243dp"
                 android:orientation="horizontal"

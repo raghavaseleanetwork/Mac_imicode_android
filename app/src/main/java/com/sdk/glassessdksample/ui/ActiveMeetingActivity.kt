@@ -29,6 +29,7 @@ import com.google.ai.client.generativeai.type.content
 import com.sdk.glassessdksample.R
 import kotlinx.coroutines.*
 import java.util.*
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Activity for recording meeting audio, then converting to text at the end
@@ -102,6 +103,7 @@ class ActiveMeetingActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_active_meeting)
+        SystemBarsInsets.apply(this)
         // Recording must keep running while the user looks away from the phone.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         

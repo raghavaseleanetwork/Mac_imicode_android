@@ -20,6 +20,18 @@
             android:paddingTop="14dp"
             android:paddingBottom="10dp">
 
+            <!-- Shown only while two Bluetooth audio devices are connected at once
+                 (see MultipleBluetoothBanner). Warns the user and locks quick-start
+                 until the other device is disconnected, since Android cannot
+                 guarantee audio routes to the glasses in that state. -->
+            <include
+                android:id="@+id/multiBluetoothBanner"
+                layout="@layout/view_multi_bluetooth_banner"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="14dp"
+                android:visibility="gone" />
+
             <!-- Header -->
             <LinearLayout
                 android:layout_width="match_parent"
@@ -128,6 +140,7 @@
                         android:gravity="center_vertical">
 
                         <LinearLayout
+                            android:id="@+id/layoutDestinationChip"
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
                             android:layout_weight="1"
@@ -137,7 +150,8 @@
                             android:paddingStart="12dp"
                             android:paddingTop="8dp"
                             android:paddingEnd="12dp"
-                            android:paddingBottom="8dp">
+                            android:paddingBottom="8dp"
+                            android:visibility="gone">
 
                             <ImageView
                                 android:layout_width="14dp"
@@ -147,9 +161,9 @@
                                 app:tint="#ADADAD" />
 
                             <TextView
+                                android:id="@+id/tvDestinationName"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
-                                android:text="Stansted Airport"
                                 android:textColor="#ADADAD"
                                 android:textSize="11sp" />
                         </LinearLayout>
@@ -242,20 +256,23 @@
                             android:orientation="horizontal">
 
                             <View
+                                android:id="@+id/viewGlassStatusDot"
                                 android:layout_width="10dp"
                                 android:layout_height="10dp"
                                 android:layout_marginEnd="8dp"
                                 android:background="@drawable/ic_status_dot" />
 
                             <TextView
+                                android:id="@+id/tvGlassStatus"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
-                                android:text="Connected"
+                                android:text="Not connected"
                                 android:textColor="#ADADAD"
                                 android:textSize="13sp" />
                         </LinearLayout>
 
                         <LinearLayout
+                            android:id="@+id/rowGlassBattery"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="4dp"
@@ -265,18 +282,31 @@
                                 android:id="@+id/tvTimeRemaining"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
-                                android:text="2h 31m"
+                                android:text=""
                                 android:textColor="#FFA7B0B9"
                                 android:textSize="13sp"
                                 android:textStyle="bold" />
 
                             <TextView
+                                android:id="@+id/tvTimeRemainingLabel"
                                 android:layout_width="wrap_content"
                                 android:layout_height="wrap_content"
                                 android:text=" remaining"
                                 android:textColor="#9A9A9A"
                                 android:textSize="13sp" />
                         </LinearLayout>
+
+                        <!-- Shown instead of the battery row when nothing is paired. -->
+                        <TextView
+                            android:id="@+id/tvGlassConnectHint"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="4dp"
+                            android:text="Tap to connect"
+                            android:textColor="#D87D41"
+                            android:textSize="13sp"
+                            android:textStyle="bold"
+                            android:visibility="gone" />
 
                         <ImageView
                             android:id="@+id/ivGlassImage"
@@ -312,6 +342,7 @@
                             android:paddingBottom="8dp">
 
                             <ImageView
+                                android:id="@+id/ivAiActionIcon"
                                 android:layout_width="20dp"
                                 android:layout_height="20dp"
                                 android:layout_marginEnd="6dp"
@@ -325,6 +356,7 @@
                                 android:orientation="vertical">
 
                                 <TextView
+                                    android:id="@+id/tvAiActionTitle"
                                     android:layout_width="wrap_content"
                                     android:layout_height="wrap_content"
                                     android:ellipsize="end"
@@ -334,6 +366,7 @@
                                     android:textSize="11sp" />
 
                                 <TextView
+                                    android:id="@+id/tvAiActionSubtitle"
                                     android:layout_width="wrap_content"
                                     android:layout_height="wrap_content"
                                     android:ellipsize="end"
@@ -344,52 +377,6 @@
                             </LinearLayout>
                         </LinearLayout>
 
-                        <LinearLayout
-                            android:id="@+id/btnVoiceCommand"
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:minHeight="62dp"
-                            android:layout_marginBottom="8dp"
-                            android:background="@drawable/bg_home_secondary_btn"
-                            android:gravity="center_vertical"
-                            android:orientation="horizontal"
-                            android:paddingStart="10dp"
-                            android:paddingTop="8dp"
-                            android:paddingEnd="8dp"
-                            android:paddingBottom="8dp">
-
-                            <ImageView
-                                android:layout_width="20dp"
-                                android:layout_height="20dp"
-                                android:layout_marginEnd="6dp"
-                                android:src="@drawable/ic_stop_square"
-                                app:tint="#ADADAD" />
-
-                            <LinearLayout
-                                android:layout_width="0dp"
-                                android:layout_height="wrap_content"
-                                android:layout_weight="1"
-                                android:orientation="vertical">
-
-                                <TextView
-                                    android:layout_width="wrap_content"
-                                    android:layout_height="wrap_content"
-                                    android:ellipsize="end"
-                                    android:maxLines="1"
-                                    android:text="AI Stop"
-                                    android:textColor="#FFFFFF"
-                                    android:textSize="11sp" />
-
-                                <TextView
-                                    android:layout_width="wrap_content"
-                                    android:layout_height="wrap_content"
-                                    android:ellipsize="end"
-                                    android:maxLines="1"
-                                    android:text="End conversation"
-                                    android:textColor="#9A9A9A"
-                                    android:textSize="9sp" />
-                            </LinearLayout>
-                        </LinearLayout>
 
                         <LinearLayout
                             android:layout_width="match_parent"
@@ -672,10 +659,11 @@
                             android:textStyle="bold" />
 
                         <TextView
+                            android:id="@+id/tvLetUsKnowYouSubtitle"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
-                            android:text="Answer 15 questions to personalize AI"
+                            android:text="Answer a few questions to personalize AI"
                             android:textColor="#9A9A9A"
                             android:textSize="11sp" />
                     </LinearLayout>

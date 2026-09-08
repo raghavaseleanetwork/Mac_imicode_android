@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Activity for managing user memory and AI personalization
@@ -49,6 +50,7 @@ class UserMemoryActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_user_memory)
+        SystemBarsInsets.apply(this)
         
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         supportActionBar?.title = "AI Memory Settings"

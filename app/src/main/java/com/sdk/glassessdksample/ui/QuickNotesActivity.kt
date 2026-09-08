@@ -17,6 +17,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Quick Notes - lists user notes grouped by month with two tabs:
@@ -42,6 +43,7 @@ class QuickNotesActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_quick_notes)
+        SystemBarsInsets.apply(this)
 
         notesManager = QuickNotesManager(this)
         setupUI()

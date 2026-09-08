@@ -91,7 +91,11 @@ class HeyImiWakeWordDetector(
     private var lastExternalPriorityLogTs = 0L
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var chimePlayer: MediaPlayer? = null
+    // Context handle for the shared WakeChimePlayer, not a per-detector player.
+    // Each detector used to own a MediaPlayer here; playback now goes through the
+    // one shared SoundPool so the chime survives the SCO route the detector runs
+    // under, and there is nothing per-detector left to release.
+    private var chimePlayer: Context? = null
 
     private val rollingBuffer = ShortArray(BUFFER_SIZE)
     private val bufferLock = Any()
@@ -227,7 +231,6 @@ class HeyImiWakeWordDetector(
         try {
             session?.close()
             ortEnv?.close()
-            chimePlayer?.release()
         } catch (_: Exception) {
         }
         session = null

@@ -6,6 +6,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.sdk.glassessdksample.auth.AuthApi
 import com.sdk.glassessdksample.databinding.ActivityLoginBinding
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class LoginActivity : AppCompatActivity() {
 
@@ -17,6 +18,7 @@ class LoginActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityLoginBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
 
         binding.btnLogin.setOnClickListener {
             performLogin()

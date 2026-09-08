@@ -64,10 +64,15 @@ class GeminiAIClient(
     }
 
     // Compact system prompt for lower token usage in chat.
-    private val baseSystemPrompt = """
+    //
+    // Answer length and tone are deliberately NOT stated here: they come from the
+    // user's AI Preferences and are appended by [baseSystemPrompt] below. This
+    // block used to say "Keep answers short and practical (usually 1-2 sentences)",
+    // which silently overrode the Settings choice - picking Balanced or Detailed
+    // changed nothing, because this line always won.
+    private val baseSystemPromptTemplate = """
         You are Imi Glass, an AI assistant for smart glasses by IMI Wearables.
         Reply in the same language as the user (Hindi or English).
-        Keep answers short and practical (usually 1-2 sentences).
         Give direct answers first; no long introductions.
         You can see the user's saved Quick Notes, Meeting Minutes (summaries and
         transcripts), captured photos, and learned profile. When the user asks
@@ -76,6 +81,23 @@ class GeminiAIClient(
         If asked who made you, say you were built by Ajay Mehta at IMI Wearables.
         If uncertain, say so clearly instead of guessing.
     """.trimIndent()
+
+    /**
+     * Base prompt with the user's chosen answer length and tone applied.
+     *
+     * A getter rather than a val: it is read on every request, so changing the
+     * preference in Settings takes effect on the next message instead of needing
+     * the app restarted. Falls back to the bare template when no context is
+     * available (this client is constructible without one).
+     */
+    private val baseSystemPrompt: String
+        get() {
+            val style = context?.let {
+                runCatching { AiResponsePrefs.buildResponseStyleInstruction(it) }.getOrNull()
+            }
+            return if (style.isNullOrBlank()) baseSystemPromptTemplate
+            else "$baseSystemPromptTemplate\n$style"
+        }
 
     private fun trimForPrompt(text: String, maxChars: Int): String {
         val normalized = text
@@ -181,8 +203,6 @@ class GeminiAIClient(
             ${if (galleryContext.isNotBlank()) "\n$galleryContext" else ""}
             ${if (notesContext.isNotBlank()) "\n$notesContext" else ""}
             ${if (meetingsContext.isNotBlank()) "\n$meetingsContext" else ""}
-
-            Keep replies concise and helpful.
             """.trimIndent(), maxLen)
         }
     }

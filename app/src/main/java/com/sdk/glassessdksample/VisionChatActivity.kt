@@ -53,6 +53,7 @@ import android.os.Build
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Vision Chat Activity - WiFi HTTP-based Image Transfer
@@ -328,6 +329,7 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_vision_chat)
+        SystemBarsInsets.apply(this)
 
         // ⚡ PRE-WARM: Start server & network immediately on open
         // so by the time user captures a photo, connection is ready (no cold-start delay)
@@ -950,7 +952,7 @@ class VisionChatActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return largestBytes
     }
     
-    /**
+        /**
      * Recursively extract ByteArray from an object using reflection (depth-limited).
      * DEPRECATED - use extractAllBytesFromObject instead
      */

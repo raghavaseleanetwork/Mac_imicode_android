@@ -32,6 +32,7 @@ import kotlinx.coroutines.*
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Live Gallery shows every photo captured from the glasses.
@@ -204,6 +205,7 @@ class LiveGalleryActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_live_gallery)
+        SystemBarsInsets.apply(this)
 
         albumDownloader = AlbumDownloader(this)
         wifiP2pHelper   = WifiP2pHelper(this)

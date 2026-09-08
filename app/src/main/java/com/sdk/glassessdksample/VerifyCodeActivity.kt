@@ -10,6 +10,7 @@ import android.widget.EditText
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.sdk.glassessdksample.databinding.ActivityVerifyCodeBinding
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class VerifyCodeActivity : AppCompatActivity() {
 
@@ -22,6 +23,7 @@ class VerifyCodeActivity : AppCompatActivity() {
         try {
             binding = ActivityVerifyCodeBinding.inflate(layoutInflater)
             setContentView(binding.root)
+            SystemBarsInsets.apply(this)
 
             phoneNumber = intent.getStringExtra("PHONE_NUMBER") ?: ""
 

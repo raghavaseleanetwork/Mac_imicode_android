@@ -16,6 +16,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * 🔐 Image Descriptions Vault — hidden page
@@ -49,6 +50,7 @@ class ImageDescriptionVaultActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_image_description_vault)
+        SystemBarsInsets.apply(this)
 
         rvVault      = findViewById(R.id.rvVault)
         tvVaultCount = findViewById(R.id.tvVaultCount)

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+        Android 10+ draws a translucent contrast scrim behind transparent system
+        bars. With the app's gradient running edge-to-edge that scrim showed up
+        as an off-colour band under the floating nav pill, which is part of what
+        made the bottom bar look misaligned. Opt out so the gradient is unbroken.
+    -->
+    <style name="Theme.GlassesSDKSample" parent="Theme.GlassesSDKSample.Base">
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+    </style>
+
+</resources>

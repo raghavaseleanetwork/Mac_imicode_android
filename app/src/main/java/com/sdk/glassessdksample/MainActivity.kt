@@ -73,11 +73,14 @@ import java.io.File
 import java.io.FileInputStream
 import java.util.Locale
 import kotlin.coroutines.resume
+import com.sdk.glassessdksample.utils.SystemBarsInsets
+import com.sdk.glassessdksample.utils.WakeChimePlayer
 
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private val TAG = "SmartGlassAI"
     private lateinit var binding: ActivityMainBinding
+    private lateinit var multiBluetoothBanner: com.sdk.glassessdksample.ui.MultiBluetoothBanner
     private var audioManager: AudioManager? = null
 
     private var tts: TextToSpeech? = null
@@ -107,8 +110,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private var isListening = false
+
+    // The home card carries a single AI button that flips between "Quick Wake" and
+    // "AI Stop". These two flags are the source of truth for that state and are set
+    // from ~19 places across this file, so rather than repainting at every call site
+    // (and inevitably missing one), the setters repaint whenever the value changes.
     private var isInConversationMode = false
+        set(value) {
+            val changed = field != value
+            field = value
+            if (changed) refreshAiButtonUi()
+        }
     private var isGeminiLiveMode = false // Track if using Gemini Live bidirectional audio
+        set(value) {
+            val changed = field != value
+            field = value
+            if (changed) refreshAiButtonUi()
+        }
 
     /**
      * Latched for the whole lifetime of a Gemini Live session, from the first start
@@ -275,12 +293,30 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private val chatMessages = mutableListOf<ChatMessage>()
     
     private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { /* no-op */ }
+
+    private val multiBluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                android.bluetooth.BluetoothDevice.ACTION_ACL_CONNECTED,
+                android.bluetooth.BluetoothDevice.ACTION_ACL_DISCONNECTED,
+                AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED -> multiBluetoothBanner.refresh()
+            }
+        }
+    }
     private val deviceNotifyListener by lazy { MyDeviceNotifyListener() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
+
+        multiBluetoothBanner = com.sdk.glassessdksample.ui.MultiBluetoothBanner(this, binding.multiBluetoothBanner.root)
+
+        // Decode the wake chime up front. SoundPool loads asynchronously, and a
+        // cold decode on the first "Hey IMI" was one reason that first chime was
+        // routinely missed.
+        WakeChimePlayer.preload(this)
 
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         tts = TextToSpeech(this, this)
@@ -307,7 +343,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         
         customVoiceDetector = CustomVoiceDetector(this)
-        geminiClient = GeminiLiveApiClient()
+        geminiClient = GeminiLiveApiClient(this)
         visionClient = GeminiAIClient(this) // Initialize vision client with context for user memory
         userMemoryManager = com.sdk.glassessdksample.ui.UserMemoryManager(this)  // Auto-learning memory
         wifiTransferManager = WifiTransferManager(this) // Initialize WiFi transfer
@@ -885,6 +921,25 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     override fun onResume() {
         super.onResume()
 
+        // The user may have paired or unpaired in DeviceBindActivity while we were
+        // stopped, and a link can also drop with no event delivered to a paused
+        // Activity - so re-read the real state rather than trusting the last paint.
+        refreshGlassConnectionUi()
+        refreshAiButtonUi()
+        refreshNotificationBadge()
+        refreshLetUsKnowYouSubtitle()
+        multiBluetoothBanner.refresh()
+        androidx.core.content.ContextCompat.registerReceiver(
+            this,
+            multiBluetoothStateReceiver,
+            IntentFilter().apply {
+                addAction(android.bluetooth.BluetoothDevice.ACTION_ACL_CONNECTED)
+                addAction(android.bluetooth.BluetoothDevice.ACTION_ACL_DISCONNECTED)
+                addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
+            },
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+
         // Seamless hand-back: if a conversation started while the phone was locked
         // is still running, turning the screen on must NOT tear it down. Tell the
         // service to release the session and let the in-app flow take over the mic.
@@ -1289,10 +1344,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     am.requestAudioFocus(audioFocusListener, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
                 } catch (_: Exception) {}
 
-                // Try to enable SCO routing quickly
-                try { if (!am.isBluetoothScoOn) { am.setBluetoothScoOn(true) } } catch (_: Exception) {}
-                try { am.startBluetoothSco() } catch (_: Exception) {}
+                // Try to enable SCO routing quickly — prefer explicitly targeting the
+                // glasses (Android 12+) over the legacy calls, which just take
+                // whichever Bluetooth device the OS reports first and can misroute
+                // audio to a second connected Bluetooth accessory.
                 try { am.mode = AudioManager.MODE_IN_COMMUNICATION } catch (_: Exception) {}
+                val routedToGlasses = try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val bt = com.sdk.glassessdksample.ui.PreferredAudioDeviceResolver.findGlasses(
+                            this@MainActivity, am.availableCommunicationDevices,
+                            android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        )
+                        bt != null && am.setCommunicationDevice(bt)
+                    } else false
+                } catch (_: Exception) { false }
+                if (!routedToGlasses) {
+                    try { if (!am.isBluetoothScoOn) { am.setBluetoothScoOn(true) } } catch (_: Exception) {}
+                    try { am.startBluetoothSco() } catch (_: Exception) {}
+                }
             }
 
             // Play tone after a tiny settle to let routing take effect
@@ -1325,9 +1394,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         // Prepare SCO and request focus for voice call stream
                         pendingScoSpeechText = text
                         pendingScoUtteranceId = utteranceId
-                        try { am.setBluetoothScoOn(true) } catch (_: Exception) {}
                         try { am.requestAudioFocus(audioFocusListener, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT) } catch (_: Exception) {}
-                        try { am.startBluetoothSco() } catch (_: Exception) {}
+                        // Prefer explicitly targeting the glasses over the legacy
+                        // calls, which can misroute to a second connected Bluetooth
+                        // accessory (see PreferredAudioDeviceResolver).
+                        val routedToGlasses = try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                val bt = com.sdk.glassessdksample.ui.PreferredAudioDeviceResolver.findGlasses(
+                                    this@MainActivity, am.availableCommunicationDevices,
+                                    android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                                )
+                                bt != null && am.setCommunicationDevice(bt)
+                            } else false
+                        } catch (_: Exception) { false }
+                        if (!routedToGlasses) {
+                            try { am.setBluetoothScoOn(true) } catch (_: Exception) {}
+                            try { am.startBluetoothSco() } catch (_: Exception) {}
+                        }
 
                         mainScope.launch {
                             val connected = tryStartScoWithRetries(5000L)
@@ -1702,6 +1785,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      * Actually start Gemini Live (called after connection check)
      */
     private fun proceedWithGeminiLive() {
+        // With two Bluetooth audio devices connected at once, the app cannot
+        // reliably force audio to the glasses (Android's own routing decides).
+        // Block starting a conversation — the banner already shows why and how
+        // to fix it, so this just keeps the lock consistent with that UI.
+        if (multiBluetoothBanner.refresh()) {
+            Log.w(TAG, "⚠️ Multiple Bluetooth audio devices connected — not starting Gemini Live")
+            Toast.makeText(
+                this,
+                "Two Bluetooth devices connected. Disconnect the other one so audio goes to your glasses.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
         // MARK 2: refuse to start a second session on top of a live one.
         //
         // A single wake word reaches here TWICE — once from the in-app handler and
@@ -1824,14 +1921,26 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 Log.d(TAG, "🎧 Enabling Glass Headset (Option A - System Audio)")
 
                 // Simple 3-step process
-                am.mode = AudioManager.MODE_IN_CALL
+                am.mode = AudioManager.MODE_IN_COMMUNICATION
                 am.requestAudioFocus(
                     audioFocusListener,
                     AudioManager.STREAM_VOICE_CALL,
                     AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
                 )
 
-                if (am.isBluetoothScoAvailableOffCall) {
+                // Prefer explicitly targeting the glasses over the legacy calls,
+                // which can misroute to a second connected Bluetooth accessory
+                // (see PreferredAudioDeviceResolver).
+                val routedToGlasses = try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val bt = com.sdk.glassessdksample.ui.PreferredAudioDeviceResolver.findGlasses(
+                            this@MainActivity, am.availableCommunicationDevices,
+                            android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        )
+                        bt != null && am.setCommunicationDevice(bt)
+                    } else false
+                } catch (_: Exception) { false }
+                if (!routedToGlasses && am.isBluetoothScoAvailableOffCall) {
                     am.startBluetoothSco()
                     am.isBluetoothScoOn = true
                 }
@@ -1927,8 +2036,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         Log.d(TAG, "🔄 Simple SCO start (automatic routing)")
         val am = audioManager ?: return false
         try {
-            // Set audio mode to IN_CALL to encourage system routing
-            am.mode = AudioManager.MODE_IN_CALL
+            // Set audio mode to IN_COMMUNICATION to encourage system routing
+            am.mode = AudioManager.MODE_IN_COMMUNICATION
 
             // Request audio focus for voice communication
             try {
@@ -1937,8 +2046,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 Log.w(TAG, "Audio focus request failed: ${e.message}")
             }
 
+            // Prefer explicitly targeting the glasses over the legacy SCO calls,
+            // which can misroute to a second connected Bluetooth accessory
+            // (see PreferredAudioDeviceResolver).
+            val routedToGlasses = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val bt = com.sdk.glassessdksample.ui.PreferredAudioDeviceResolver.findGlasses(
+                        this@MainActivity, am.availableCommunicationDevices,
+                        android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    )
+                    bt != null && am.setCommunicationDevice(bt)
+                } else false
+            } catch (_: Exception) { false }
+
             // Start SCO if available
-            if (am.isBluetoothScoAvailableOffCall) {
+            if (!routedToGlasses && am.isBluetoothScoAvailableOffCall) {
                 try {
                     am.startBluetoothSco()
                     am.isBluetoothScoOn = true
@@ -2456,6 +2578,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         when (event.type) {
             BluetoothEvent.EventType.CONNECTED -> {
                 showGlassConnectingPopup()
+                refreshGlassConnectionUi()
                 startWakeWordDetectorIfReady("bluetooth-event-connected")
                 // Warm SCO on glass connect so mic is ready for wake detection
                 try {
@@ -2472,6 +2595,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
             BluetoothEvent.EventType.DISCONNECTED -> {
                 Toast.makeText(this, "Glass Disconnected", Toast.LENGTH_SHORT).show()
+                // Drop the battery reading with the link; keeping it would let the card
+                // show a runtime for a device that is no longer there.
+                glassBatteryLevel = null
+                refreshGlassConnectionUi()
                 stopWakeWordDetector("bluetooth-event-disconnected")
 
                 if (isGeminiLiveMode || isInConversationMode) {
@@ -2521,36 +2648,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     // scanned Download/ for a side-loaded bmw_warning_chime.mp3, which
                     // silently took priority over the packaged sound; that lookup is
                     // gone so the bundled chime is the only wake sound.
-                    try {
-                        var played = false
-                        Log.d(TAG, "Playing wake chime from res/raw resource")
-                        val mp = MediaPlayer.create(this, R.raw.wake_chime)
-                        mp?.let { player ->
-                            try {
-                                // Ensure playback on music stream and full volume
-                                try { player.setAudioStreamType(AudioManager.STREAM_MUSIC) } catch (_: Exception) {}
-                                try { player.setVolume(1.0f, 1.0f) } catch (_: Exception) {}
-                            } catch (_: Exception) {}
-                            player.setOnCompletionListener {
-                                try { it.release() } catch (_: Exception) {}
-                            }
-                            player.start()
-                            // Start connecting IN PARALLEL with the chime. The chime is
-                            // ~1s and the socket/SCO setup does not need the speaker, so
-                            // waiting for playback to finish just added a second of dead
-                            // air before IMI could listen.
-                            startGeminiNow()
-                            played = true
-                        }
-
-                        if (!played) {
-                                Log.w(TAG, "No chime found; starting Gemini Live immediately (no beep fallback)")
-                                startGeminiNow()
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to play chime, starting Gemini Live immediately: ${e.message}")
-                        startGeminiNow()
-                    }
+                    // Played through WakeChimePlayer (SoundPool, voice-communication
+                    // attributes) rather than a MediaPlayer opened on STREAM_MUSIC.
+                    // By this point SCO is already up for the glasses mic and A2DP is
+                    // suspended, so a fresh media-stream player was being rendered to a
+                    // suspended/re-routing path — accepted by the OS, silent on many
+                    // phones, and with nothing in the logs to show for it. The shared
+                    // player also decodes once up front instead of synchronously on
+                    // every wake, which is what lost the chime on slower devices.
+                    // Starts the conversation in parallel; the callback always fires.
+                    Log.d(TAG, "Playing wake chime")
+                    WakeChimePlayer.play(this) { startGeminiNow() }
                     
                     voiceCommandEnabled = true
                 }
@@ -2651,6 +2759,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 (event.data as? Int)?.let { batteryPercent ->
                     glassBatteryLevel = batteryPercent
                     Log.d(TAG, "🔋 Glass battery: $batteryPercent%")
+                    BatteryStatusStore.saveBatteryLevel(this, batteryPercent)
+                    refreshGlassConnectionUi()
                 }
             }
             else -> {}
@@ -4957,7 +5067,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             
             pendingDistanceOrigin = origin
             pendingDistanceDestination = destination
-            
+            updateDestinationChip(destination)
+
             // Show on Google Maps first
             showDistanceOnMap(origin, destination)
             
@@ -5225,9 +5336,155 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         })
     }
 
+    /**
+     * Paints the "Connect Glass" card from the real BLE state.
+     *
+     * The card used to be hardcoded in XML to "Connected / 2h 31m remaining", so it
+     * claimed a live pair even with nothing bound. Connection state and battery are
+     * already tracked (BleOperateManager + BluetoothEvent), they were simply never
+     * bound to these views.
+     */
+    private fun refreshGlassConnectionUi() {
+        val connected = try {
+            checkBLEConnection()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not read glass connection state: ${e.message}")
+            false
+        }
+
+        // Prefer the level from this session's BATTERY_LEVEL events; fall back to the
+        // last persisted reading so the card is populated immediately on a cold start.
+        val battery = glassBatteryLevel ?: BatteryStatusStore.getBatteryLevel(this)
+
+        if (connected) {
+            binding.tvGlassStatus.text = "Connected"
+            binding.tvGlassStatus.setTextColor(android.graphics.Color.parseColor("#ADADAD"))
+            binding.viewGlassStatusDot.backgroundTintList =
+                android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#4CAF50"))
+            binding.tvGlassConnectHint.visibility = View.GONE
+            binding.ivGlassImage.alpha = 1.0f
+
+            if (battery != null) {
+                binding.rowGlassBattery.visibility = View.VISIBLE
+                binding.tvTimeRemaining.text = formatGlassRuntime(battery)
+                binding.tvTimeRemainingLabel.text = " remaining"
+            } else {
+                // Connected, but the glasses have not reported a level yet. Showing a
+                // stale duration here is what made the card untrustworthy, so say so.
+                binding.rowGlassBattery.visibility = View.VISIBLE
+                binding.tvTimeRemaining.text = "Battery"
+                binding.tvTimeRemainingLabel.text = " unavailable"
+            }
+        } else {
+            binding.tvGlassStatus.text = "Not connected"
+            binding.tvGlassStatus.setTextColor(android.graphics.Color.parseColor("#9A9A9A"))
+            binding.viewGlassStatusDot.backgroundTintList =
+                android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#7A7A7A"))
+            binding.rowGlassBattery.visibility = View.GONE
+            binding.tvGlassConnectHint.visibility = View.VISIBLE
+            // Dim the render so the card reads as an empty slot, not a live device.
+            binding.ivGlassImage.alpha = 0.35f
+        }
+    }
+
+    /**
+     * The home screen's destination chip used to show a fixed "Stansted Airport"
+     * regardless of the user's actual plans. There is no persistent "next trip"
+     * data source in the app, so the chip stays hidden until the user actually
+     * asks for a distance/route (calculateDistance), then shows that destination.
+     */
+    private fun updateDestinationChip(destination: String) {
+        try {
+            binding.tvDestinationName.text = destination
+            binding.layoutDestinationChip.visibility = View.VISIBLE
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not update destination chip: ${e.message}")
+        }
+    }
+
+    /**
+     * Reflects the real unread-notification count on the profile icon's badge,
+     * instead of the fixed placeholder that used to sit there.
+     */
+    private fun refreshLetUsKnowYouSubtitle() {
+        try {
+            binding.tvLetUsKnowYouSubtitle.text =
+                "Answer ${LetUsKnowYouActivity.QUESTION_COUNT} questions to personalize AI"
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not update Let Us Know You subtitle: ${e.message}")
+        }
+    }
+
+    private fun refreshNotificationBadge() {
+        try {
+            val count = NotificationListener.getRecentNotifications(this).size
+            if (count > 0) {
+                binding.notificationBadge.text = if (count > 9) "9+" else count.toString()
+                binding.notificationBadge.visibility = View.VISIBLE
+            } else {
+                binding.notificationBadge.visibility = View.GONE
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not refresh notification badge: ${e.message}")
+        }
+    }
+
+    /**
+     * Rough remaining runtime from a battery percentage.
+     *
+     * The glasses report a percentage only - there is no time-to-empty characteristic -
+     * so this scales against a full-charge figure. Approximate by nature, which is why
+     * it is presented as "remaining" rather than a countdown.
+     */
+    private fun formatGlassRuntime(batteryPercent: Int): String {
+        val fullChargeMinutes = 180 // ~3h from a full charge
+        val minutes = (batteryPercent.coerceIn(0, 100) * fullChargeMinutes) / 100
+        val hours = minutes / 60
+        val mins = minutes % 60
+        return if (hours > 0) "${hours}h ${mins}m" else "${mins}m"
+    }
+
+    /** True while a Gemini Live session or a wake-word conversation is running. */
+    private fun isAiSessionActive(): Boolean = isGeminiLiveMode || isInConversationMode
+
+    /**
+     * Paints the single AI button on the home card.
+     *
+     * Idle  -> "Quick Wake / Wake instantly" (eye icon)
+     * Active-> "AI Stop / End conversation"  (stop icon, orange)
+     *
+     * Called from the isGeminiLiveMode / isInConversationMode setters, so it can be
+     * reached before onCreate has inflated the binding - hence the initialised guard.
+     */
+    private fun refreshAiButtonUi() {
+        if (!::binding.isInitialized) return
+
+        // Flag changes arrive from background callbacks (Gemini socket, BLE), and
+        // touching views off the main thread would crash.
+        runOnUiThread {
+            if (isAiSessionActive()) {
+                binding.ivAiActionIcon.setImageResource(R.drawable.ic_stop_square)
+                binding.ivAiActionIcon.imageTintList =
+                    android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FF7F2E"))
+                binding.tvAiActionTitle.text = "AI Stop"
+                binding.tvAiActionSubtitle.text = "End conversation"
+            } else {
+                binding.ivAiActionIcon.setImageResource(R.drawable.ic_eye)
+                binding.ivAiActionIcon.imageTintList =
+                    android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#ADADAD"))
+                binding.tvAiActionTitle.text = "Quick Wake"
+                binding.tvAiActionSubtitle.text = "Wake instantly"
+            }
+        }
+    }
+
     private fun initView() {
         // Update location and time
         updateLocationAndTime()
+
+        // Paint the glass card from real state rather than the XML placeholder.
+        refreshGlassConnectionUi()
+        refreshAiButtonUi()
         
         // Load glass image from assets
         try {
@@ -5239,21 +5496,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             Log.e(TAG, "Error loading glass1.png: ${e.message}")
         }
         
-        // Quick wake button - bypass voice detection, directly trigger wake
+        // Single AI button: starts a conversation when idle, ends it when one is
+        // running. Previously these were two separate buttons, one of which was
+        // always a no-op that just toasted "No active conversation".
         binding.btnQuickWake.setOnClickListener {
-            Log.d(TAG, "🎙️ Quick Wake button pressed - triggering wake event")
-            EventBus.getDefault().post(BluetoothEvent(BluetoothEvent.EventType.VOICE_TEXT, "wake up"))
-        }
-
-        // AI Stop button - end the active conversation and return to wake-word listening
-        binding.btnVoiceCommand.setOnClickListener {
-            if (isGeminiLiveMode || isInConversationMode) {
-                Log.d(TAG, "🛑 AI Stop button pressed - ending conversation")
+            if (isAiSessionActive()) {
+                Log.d(TAG, "🛑 AI Stop pressed - ending conversation")
                 stopGeminiLiveConversation()
                 Toast.makeText(this, "AI conversation stopped", Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(this, "No active conversation", Toast.LENGTH_SHORT).show()
+                Log.d(TAG, "🎙️ Quick Wake pressed - triggering wake event")
+                EventBus.getDefault().post(BluetoothEvent(BluetoothEvent.EventType.VOICE_TEXT, "wake up"))
             }
+            // The wake path turns the session on asynchronously, so the flag setters
+            // drive the repaint; this covers the stop path landing synchronously.
+            refreshAiButtonUi()
         }
         
         // Interrupt Mode Switch - Enable/Disable AI interruption when user speaks
@@ -5481,9 +5738,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     
     override fun onPause() {
         super.onPause()
+        try { unregisterReceiver(multiBluetoothStateReceiver) } catch (_: Exception) {}
         // Save conversation history when app goes to background
         saveConversationHistory()
-        
+
         // DON'T stop listening - keep conversation active in background
         Log.d(TAG, "App paused - conversation continues in background (mode: $isInConversationMode)")
     }
@@ -7587,14 +7845,27 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 Log.d(TAG, "🎧 Configuring audio for Glass Headset Mode")
 
                 // Set audio mode for Bluetooth voice call
-                am.mode = AudioManager.MODE_IN_CALL
-                
+                am.mode = AudioManager.MODE_IN_COMMUNICATION
+
+                // Prefer explicitly targeting the glasses over the legacy SCO
+                // calls, which can misroute to a second connected Bluetooth
+                // accessory (see PreferredAudioDeviceResolver).
+                val routedToGlasses = try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val bt = com.sdk.glassessdksample.ui.PreferredAudioDeviceResolver.findGlasses(
+                            this@MainActivity, am.availableCommunicationDevices,
+                            android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        )
+                        bt != null && am.setCommunicationDevice(bt)
+                    } else false
+                } catch (_: Exception) { false }
+
                 // Start Bluetooth SCO for glass mic/speaker
-                if (!am.isBluetoothScoOn) {
+                if (!routedToGlasses && !am.isBluetoothScoOn) {
                     Log.d(TAG, "📡 Starting Bluetooth SCO...")
                     am.startBluetoothSco()
                     am.isBluetoothScoOn = true
-                    
+
                     // Wait briefly for SCO to connect
                     mainScope.launch {
                         var retries = 0

@@ -9,6 +9,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * History screen with two states:
@@ -36,6 +37,7 @@ class ConversationHistoryActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_conversation_history)
+        SystemBarsInsets.apply(this)
 
         viewRecents = findViewById(R.id.view_recents)
         viewThread = findViewById(R.id.view_thread)

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.GlassesSDKSample" parent="Theme.Material3.DayNight.NoActionBar">
+    <style name="Theme.GlassesSDKSample.Base" parent="Theme.Material3.DayNight.NoActionBar">
 
         <!-- Typography - Neue Plak Font -->
         <item name="android:fontFamily">@font/neue_plak</item>
@@ -35,9 +35,13 @@
         <item name="colorSurface">@color/card_background</item>
         <item name="colorOnSurface">@color/text_primary</item>
 
-        <!-- Status Bar & Navigation Bar (Dark, Seamless) -->
-        <item name="android:statusBarColor">@color/glass_bg_end</item>
-        <item name="android:navigationBarColor">@color/glass_bg_end</item>
+        <!-- Status Bar & Navigation Bar.
+             Transparent so the app's own gradient runs behind them edge-to-edge;
+             SystemBarsInsets keeps content clear of the bars at runtime. Opaque
+             bar colours here would paint a flat strip over the gradient and are
+             ignored on Android 15+ anyway. -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
 
@@ -55,6 +59,10 @@
         <item name="android:windowAnimationStyle">@style/AppWindowAnimation</item>
 
     </style>
+
+    <!-- Public theme name. Overridden in values-v29 to also disable the system
+         bar contrast scrims; this alias is what API < 29 devices resolve to. -->
+    <style name="Theme.GlassesSDKSample" parent="Theme.GlassesSDKSample.Base" />
 
 
     <!-- Window Transition Animations -->

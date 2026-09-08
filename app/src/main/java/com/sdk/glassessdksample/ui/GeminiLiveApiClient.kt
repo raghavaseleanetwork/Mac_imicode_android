@@ -21,12 +21,25 @@ class GeminiLiveApiClient(private val context: Context? = null) {
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
-    // System prompt
-    private val systemPrompt = """
-        You are Imi Glass, an intelligent AI assistant.
-        Keep responses concise (1-2 sentences).
-        Respond in the same language the user speaks.
-    """.trimIndent()
+    // System prompt.
+    //
+    // A getter, not a val: the answer-length and tone lines come from the user's
+    // AI Preferences and must be re-read per request so a change in Settings
+    // applies to the next reply. This previously hardcoded "Keep responses concise
+    // (1-2 sentences)", which overrode the user's choice on every reply this
+    // client produced. Falls back to that wording only when no context is
+    // available to read the preference from.
+    private val systemPrompt: String
+        get() {
+            val style = context?.let {
+                runCatching { AiResponsePrefs.buildResponseStyleInstruction(it) }.getOrNull()
+            } ?: "Keep responses concise (1-2 sentences)."
+            return """
+                You are Imi Glass, an intelligent AI assistant.
+                $style
+                Respond in the same language the user speaks.
+            """.trimIndent()
+        }
 
     suspend fun chat(prompt: String, history: List<Pair<String, String>>): String {
         // ✅ Don't include history in Live API - it confuses the model

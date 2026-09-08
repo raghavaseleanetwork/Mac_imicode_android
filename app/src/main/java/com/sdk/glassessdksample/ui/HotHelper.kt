@@ -252,6 +252,21 @@ class HotHelper private constructor(private val context: Context) {
 
         syncEngineFromSettings()
 
+        // With two Bluetooth audio devices connected at once, Android's own
+        // routing decides which one gets the audio — the app cannot reliably
+        // force it to the glasses (see PreferredAudioDeviceResolver). Rather than
+        // silently risking "Hey IMI" going to the wrong device, block starting
+        // until only the glasses are connected, and tell the user why.
+        if (PreferredAudioDeviceResolver.hasMultipleBluetoothAudioDevicesConnected(context)) {
+            val names = PreferredAudioDeviceResolver.connectedBluetoothAudioDeviceNames(context)
+            Log.w(TAG, "⚠️ Multiple Bluetooth audio devices connected ($names) — " +
+                "not starting wake word detection until only the glasses are connected")
+            MultipleBluetoothDeviceNotifier.notify(context, names)
+            return
+        } else {
+            MultipleBluetoothDeviceNotifier.clear(context)
+        }
+
         if (isStartPending) {
             val pendingAge = System.currentTimeMillis() - startPendingSinceMs
             if (pendingAge > STALE_PENDING_TIMEOUT_MS) {
@@ -498,8 +513,9 @@ class HotHelper private constructor(private val context: Context) {
                 if (am.mode != AudioManager.MODE_IN_COMMUNICATION) {
                     am.mode = AudioManager.MODE_IN_COMMUNICATION
                 }
-                val bt = am.availableCommunicationDevices
-                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                val bt = PreferredAudioDeviceResolver.findGlasses(
+                    context, am.availableCommunicationDevices, AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                )
                 if (bt != null && am.setCommunicationDevice(bt)) {
                     Log.d(TAG, "🎧 Wake detection routed to glasses via setCommunicationDevice(${bt.productName})")
                     startDetectorInternal(requestId)

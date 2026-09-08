@@ -7,12 +7,14 @@ import android.widget.Button
 import android.widget.LinearLayout
 import androidx.appcompat.app.AppCompatActivity
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class DeviceSelectionActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_device_selection)
+        SystemBarsInsets.apply(this)
 
         val btnMark1 = findViewById<LinearLayout>(R.id.btnSelectMark1)
         val btnMark1Action = findViewById<Button>(R.id.btnSelectMark1Action)

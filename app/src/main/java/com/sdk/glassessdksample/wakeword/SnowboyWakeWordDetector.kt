@@ -63,7 +63,11 @@ class SnowboyWakeWordDetector(
 
     private var threshold = DEFAULT_THRESHOLD
     private var lastDetectionTs = 0L
-    private var chimePlayer: MediaPlayer? = null
+    // Context handle for the shared WakeChimePlayer, not a per-detector player.
+    // Each detector used to own a MediaPlayer here; playback now goes through the
+    // one shared SoundPool so the chime survives the SCO route the detector runs
+    // under, and there is nothing per-detector left to release.
+    private var chimePlayer: Context? = null
 
     @Throws(Exception::class)
     fun initialize() {
@@ -214,10 +218,6 @@ class SnowboyWakeWordDetector(
         setSensitivityMethod = null
         setAudioGainMethod = null
         applyFrontendMethod = null
-        try {
-            chimePlayer?.release()
-        } catch (_: Exception) {
-        }
         chimePlayer = null
     }
 

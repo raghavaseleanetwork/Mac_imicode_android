@@ -42,6 +42,8 @@ import org.greenrobot.eventbus.EventBus
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
 import java.util.Locale
+import com.sdk.glassessdksample.utils.SystemBarsInsets
+import com.sdk.glassessdksample.utils.WakeChimePlayer
 
 class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallbacks {
 
@@ -70,7 +72,6 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     private val musicProgressHandler = Handler(Looper.getMainLooper())
     private val wakeWordHandler = Handler(Looper.getMainLooper())
     private var pulseAnimator: AnimatorSet? = null
-    private var wakeChimePlayer: MediaPlayer? = null
     // Separate from wakeWordHandler: stopWakeWordListening() clears that one, which
     // would silently cancel an in-flight BLE-gate connection poll.
     private val bleGateHandler = Handler(Looper.getMainLooper())
@@ -115,10 +116,15 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
                 BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED,
                 BluetoothDevice.ACTION_ACL_CONNECTED,
                 BluetoothDevice.ACTION_ACL_DISCONNECTED,
-                BluetoothAdapter.ACTION_STATE_CHANGED -> checkBleAndShowGate()
+                BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    checkBleAndShowGate()
+                    multiBluetoothBanner.refresh()
+                }
             }
         }
     }
+
+    private lateinit var multiBluetoothBanner: MultiBluetoothBanner
 
     // ─────────────────────────────────────────────────────────────────────────
     // LIFECYCLE
@@ -129,6 +135,14 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
 
         binding = ActivityMark1MainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
+
+        multiBluetoothBanner = MultiBluetoothBanner(this, binding.multiBluetoothBanner.root)
+
+        // Decode the wake chime up front. SoundPool loads asynchronously, and a
+        // cold decode on the first "Hey IMI" was one reason that first chime was
+        // routinely missed.
+        WakeChimePlayer.preload(this)
 
         userMemoryManager = UserMemoryManager(this)
         notesManager = QuickNotesManager(this)
@@ -179,6 +193,7 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
 
     override fun onResume() {
         super.onResume()
+        multiBluetoothBanner.refresh()
         EventBus.getDefault().register(this)
         LocalBroadcastManager.getInstance(this)
             .registerReceiver(batteryReceiver, IntentFilter(BatteryStatusStore.ACTION_BATTERY_UPDATED))
@@ -254,8 +269,9 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         tts?.stop()
         tts?.shutdown()
         itunesMediaPlayer?.release()
-        wakeChimePlayer?.release()
-        wakeChimePlayer = null
+        // The wake chime is a shared, preloaded sample owned by WakeChimePlayer and
+        // used by the background service too, so it is deliberately NOT released
+        // here — tearing it down with this Activity would silence their wake sound.
         musicProgressHandler.removeCallbacksAndMessages(null)
         pulseAnimator?.cancel()
         geminiLiveService?.stopLiveConversation()
@@ -613,48 +629,20 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         // Backstop: if the chime never plays at all, start anyway.
         Handler(Looper.getMainLooper()).postDelayed({ startOnce() }, 1_200)
 
-        // Release the PREVIOUS chime BEFORE building the new one. This used to run
-        // after start(), so a second wake word released a player that was still
-        // sounding — the chime cut out or never played at all.
-        try { wakeChimePlayer?.release() } catch (_: Exception) {}
-        wakeChimePlayer = null
-
-        try {
-            val mp = MediaPlayer().apply {
-                setAudioAttributes(
-                    android.media.AudioAttributes.Builder()
-                        .setUsage(android.media.AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .build()
-                )
-                resources.openRawResourceFd(R.raw.wake_chime).use { afd ->
-                    setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-                }
-                setVolume(1f, 1f)
-                setOnCompletionListener { player ->
-                    try { player.release() } catch (_: Exception) {}
-                    if (wakeChimePlayer === player) wakeChimePlayer = null
-                }
-                setOnErrorListener { player, what, extra ->
-                    Log.w(TAG, "Wake chime error what=$what extra=$extra")
-                    try { player.release() } catch (_: Exception) {}
-                    if (wakeChimePlayer === player) wakeChimePlayer = null
-                    startOnce()
-                    true
-                }
-                prepare()
-                start()
-            }
-            wakeChimePlayer = mp
-            // Connect IN PARALLEL with the chime rather than waiting for it to
-            // finish. The chime is ~1s and socket/SCO setup doesn't need the
-            // speaker, so waiting just added a second of dead air before IMI
-            // could listen. Matches Mark 2's wake behaviour.
-            startOnce()
-        } catch (e: Exception) {
-            Log.w(TAG, "Chime failed: ${e.message}")
-            startOnce()
-        }
+        // Played through WakeChimePlayer rather than a local MediaPlayer. The
+        // USAGE_ASSISTANCE_SONIFICATION stream used here opened a second output
+        // against the MODE_IN_COMMUNICATION session that already holds SCO for the
+        // glasses mic; with A2DP suspended for the life of that SCO link, the OS
+        // accepted the playback and rendered it to a suspended/re-routing path, so
+        // the chime was silent on many phones with nothing in the logs. The shared
+        // player matches the session's own audio attributes and decodes once up
+        // front instead of on every wake.
+        //
+        // Connects IN PARALLEL with the chime: socket/SCO setup does not need the
+        // speaker, so waiting for playback would just add dead air before IMI can
+        // listen. startOnce() is idempotent, so the watchdog above stays a safe
+        // backstop if the chime cannot play at all.
+        WakeChimePlayer.play(this) { startOnce() }
     }
 
     private fun playChimeManuallyThenStartConversation() {
@@ -667,6 +655,21 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
 
     private fun startInlineGeminiLive() {
         if (isGeminiLiveActive) return
+
+        // With two Bluetooth audio devices connected at once, the app cannot
+        // reliably force audio to the glasses (Android's own routing decides).
+        // Block starting a conversation — the banner already shows why and how
+        // to fix it, so this just keeps the lock consistent with that UI.
+        if (multiBluetoothBanner.refresh()) {
+            Log.w(TAG, "⚠️ Multiple Bluetooth audio devices connected — not starting Gemini Live")
+            Toast.makeText(
+                this,
+                "Two Bluetooth devices connected. Disconnect the other one so audio goes to your glasses.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
         isGeminiLiveActive = true
 
         // Begin a new conversation session so every turn in this run is grouped

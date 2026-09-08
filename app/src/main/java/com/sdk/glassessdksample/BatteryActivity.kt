@@ -15,6 +15,7 @@ import com.sdk.glassessdksample.ui.BatteryStatusStore
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class BatteryActivity : AppCompatActivity() {
 
@@ -39,6 +40,7 @@ class BatteryActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityBatteryBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
 
         setupUi()
         loadInitialBattery()

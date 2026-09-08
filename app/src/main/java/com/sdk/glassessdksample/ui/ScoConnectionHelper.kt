@@ -6,7 +6,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlin.coroutines.resume
@@ -133,6 +135,26 @@ class ScoConnectionHelper(private val context: Context) {
             scoConnectionContinuation = null
         }
         
+        // Prefer explicitly targeting the glasses (Android 12+) over the legacy
+        // startBluetoothSco(), which just takes whichever Bluetooth device the OS
+        // reports first and can misroute audio to a second connected accessory.
+        val routedToGlasses = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val bt = PreferredAudioDeviceResolver.findGlasses(
+                    context, am.availableCommunicationDevices, AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                )
+                bt != null && am.setCommunicationDevice(bt)
+            } else false
+        } catch (e: Exception) { false }
+        if (routedToGlasses) {
+            Log.d(TAG, "🎧 SCO routed to glasses via setCommunicationDevice")
+            timeoutJob.cancel()
+            unregisterScoReceiver()
+            scoConnectionContinuation?.resume(true)
+            scoConnectionContinuation = null
+            return@suspendCancellableCoroutine
+        }
+
         // Start SCO connection
         try {
             Log.d(TAG, "📡 Starting Bluetooth SCO...")

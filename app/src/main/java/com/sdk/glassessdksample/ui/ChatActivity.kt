@@ -43,6 +43,7 @@ import kotlinx.coroutines.*
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * ChatActivity - Unified seamless chat experience
@@ -199,6 +200,7 @@ class ChatActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_chat)
+        SystemBarsInsets.apply(this)
         
         initViews()
         initServices()
@@ -1206,7 +1208,7 @@ class ChatActivity : AppCompatActivity() {
                 $contextPrompt
                 
                 Be descriptive and specific. Mention brands, colors, text, objects visible.
-                Keep response conversational and helpful (2-4 sentences).
+                ${AiResponsePrefs.buildResponseStyleInstruction(this@ChatActivity)}
                 If the user asked a specific question about the image, answer that directly.
             """.trimIndent()
             
@@ -1274,8 +1276,8 @@ class ChatActivity : AppCompatActivity() {
                     
                     Recent chat:
                     $conversationHistory
-                    
-                    Reply briefly and directly. Use at most 2 sentences unless user asks for detail.
+
+                    ${AiResponsePrefs.buildResponseStyleInstruction(this@ChatActivity)}
                     """.trimIndent()
                 } else {
                     userMessage

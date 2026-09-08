@@ -17,6 +17,7 @@ import androidx.core.content.FileProvider
 import com.sdk.glassessdksample.R
 import java.io.File
 import java.io.FileInputStream
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Full-screen video player for Glass Gallery videos
@@ -57,6 +58,7 @@ class VideoPlayerActivity : AppCompatActivity() {
         )
         
         setContentView(R.layout.activity_video_player)
+        SystemBarsInsets.apply(this, fullscreen = true)
         
         videoView = findViewById(R.id.videoView)
         closeButton = findViewById(R.id.btnClose)

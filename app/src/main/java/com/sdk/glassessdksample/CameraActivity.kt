@@ -11,6 +11,7 @@ import com.sdk.glassessdksample.ui.BottomNavManager
 import com.sdk.glassessdksample.ui.DeviceBindActivity
 import com.sdk.glassessdksample.ui.gallery.GlassMediaGalleryActivity
 import com.sdk.glassessdksample.utils.SafeBleCommandHelper
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class CameraActivity : AppCompatActivity() {
 
@@ -20,6 +21,7 @@ class CameraActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityCameraBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
 
         setupUi()
         BottomNavManager.setup(binding.bottomNavigation, R.id.nav_more, this)

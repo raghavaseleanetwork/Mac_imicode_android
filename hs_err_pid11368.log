@@ -1,0 +1,239 @@
+#
+# There is insufficient memory for the Java Runtime Environment to continue.
+# Native memory allocation (mmap) failed to map 266338304 bytes. Error detail: G1 virtual space
+# Possible reasons:
+#   The system is out of physical RAM or swap space
+#   This process is running with CompressedOops enabled, and the Java Heap may be blocking the growth of the native heap
+# Possible solutions:
+#   Reduce memory load on the system
+#   Increase physical memory or swap space
+#   Check if swap backing store is full
+#   Decrease Java heap size (-Xmx/-Xms)
+#   Decrease number of Java threads
+#   Decrease Java thread stack sizes (-Xss)
+#   Set larger code cache with -XX:ReservedCodeCacheSize=
+#   JVM is running with Zero Based Compressed Oops mode in which the Java heap is
+#     placed in the first 32GB address space. The Java Heap base address is the
+#     maximum limit for the native heap growth. Please use -XX:HeapBaseMinAddress
+#     to set the Java Heap base and to place the Java Heap above 32GB virtual address.
+# This output file may be truncated or incomplete.
+#
+#  Out of Memory Error (os_windows.cpp:3690), pid=11368, tid=6412
+#
+# JRE version:  (17.0.18+8) (build )
+# Java VM: OpenJDK 64-Bit Server VM (17.0.18+8-LTS, mixed mode, sharing, tiered, compressed oops, compressed class ptrs, g1 gc, windows-amd64)
+# No core dump will be written. Minidumps are not enabled by default on client versions of Windows
+#
+
+---------------  S U M M A R Y ------------
+
+Command Line: org.jetbrains.kotlin.cli.jvm.K2JVMCompiler @D:\ASELEA Work\imi new ios git push\Mac_imicode_android\app\build\20260902_2837320968954144354.compiler.options
+
+Host: Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz, 8 cores, 15G,  Windows 11 , 64 bit Build 26100 (10.0.26100.9278)
+Time: Wed Sep  2 17:39:25 2026 India Standard Time elapsed time: 0.102048 seconds (0d 0h 0m 0s)
+
+---------------  T H R E A D  ---------------
+
+Current thread (0x0000029896aacaf0):  JavaThread "Unknown thread" [_thread_in_vm, id=6412, stack(0x000000fb22400000,0x000000fb22500000)]
+
+Stack: [0x000000fb22400000,0x000000fb22500000]
+Native frames: (J=compiled Java code, j=interpreted, Vv=VM code, C=native code)
+V  [jvm.dll+0x68c879]  (no source info available)
+V  [jvm.dll+0x845979]  (no source info available)
+V  [jvm.dll+0x8476e8]  (no source info available)
+V  [jvm.dll+0x847d73]  (no source info available)
+V  [jvm.dll+0x24cf6f]  (no source info available)
+V  [jvm.dll+0x68bc79]  (no source info available)
+V  [jvm.dll+0x68023a]  (no source info available)
+V  [jvm.dll+0x3101a0]  (no source info available)
+V  [jvm.dll+0x310042]  (no source info available)
+V  [jvm.dll+0x317599]  (no source info available)
+V  [jvm.dll+0x369999]  (no source info available)
+V  [jvm.dll+0x369bcd]  (no source info available)
+V  [jvm.dll+0x2e69aa]  (no source info available)
+V  [jvm.dll+0x2e78b8]  (no source info available)
+V  [jvm.dll+0x81871e]  (no source info available)
+V  [jvm.dll+0x377601]  (no source info available)
+V  [jvm.dll+0x7f6d65]  (no source info available)
+V  [jvm.dll+0x3fd47b]  (no source info available)
+V  [jvm.dll+0x3ff0b1]  (no source info available)
+C  [jli.dll+0x52f0]  (no source info available)
+C  [ucrtbase.dll+0x2cd30]  (no source info available)
+C  [KERNEL32.DLL+0x2ccb7]  (no source info available)
+C  [ntdll.dll+0xacaec]  (no source info available)
+
+
+---------------  P R O C E S S  ---------------
+
+Threads class SMR info:
+_java_thread_list=0x00007ffb66cf6058, length=0, elements={
+}
+
+Java Threads: ( => current thread )
+
+Other Threads:
+  0x0000029896b1d620 GCTaskThread "GC Thread#0" [stack: 0x000000fb22500000,0x000000fb22600000] [id=3116]
+  0x0000029896b2efa0 ConcurrentGCThread "G1 Main Marker" [stack: 0x000000fb22600000,0x000000fb22700000] [id=20040]
+  0x0000029896b30160 ConcurrentGCThread "G1 Conc#0" [stack: 0x000000fb22700000,0x000000fb22800000] [id=15532]
+
+[error occurred during error reporting (printing all threads), id 0xc0000005, EXCEPTION_ACCESS_VIOLATION (0xc0000005) at pc=0x00007ffb664a74e7]
+
+VM state: not at safepoint (not fully initialized)
+
+VM Mutex/Monitor currently owned by a thread:  ([mutex/lock_event])
+[0x0000029896aa9670] Heap_lock - owner thread: 0x0000029896aacaf0
+
+Heap address: 0x0000000702a00000, size: 4054 MB, Compressed Oops mode: Zero based, Oop shift amount: 3
+
+CDS archive(s) mapped at: [0x0000000000000000-0x0000000000000000-0x0000000000000000), size 0, SharedBaseAddress: 0x0000000800000000, ArchiveRelocationMode: 1.
+Narrow klass base: 0x0000000000000000, Narrow klass shift: 0, Narrow klass range: 0x0
+
+GC Precious Log:
+<Empty>
+
+Heap:
+ garbage-first heap   total 0K, used 0K [0x0000000702a00000, 0x0000000800000000)
+  region size 2048K, 0 young (0K), 0 survivors (0K)
+
+[error occurred during error reporting (printing heap information), id 0xc0000005, EXCEPTION_ACCESS_VIOLATION (0xc0000005) at pc=0x00007ffb66898929]
+
+GC Heap History (0 events):
+No events
+
+Dll operation events (1 events):
+Event: 0.008 Loaded shared library C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\java.dll
+
+Deoptimization events (0 events):
+No events
+
+Classes loaded (0 events):
+No events
+
+Classes unloaded (0 events):
+No events
+
+Classes redefined (0 events):
+No events
+
+Internal exceptions (0 events):
+No events
+
+VM Operations (0 events):
+No events
+
+Memory protections (0 events):
+No events
+
+Nmethod flushes (0 events):
+No events
+
+Events (0 events):
+No events
+
+
+Dynamic libraries:
+0x00007ff6ce260000 - 0x00007ff6ce26e000 	C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\java.exe
+0x00007ffbcac80000 - 0x00007ffbcaee7000 	C:\WINDOWS\SYSTEM32\ntdll.dll
+0x00007ffbc9800000 - 0x00007ffbc98ca000 	C:\WINDOWS\System32\KERNEL32.DLL
+0x00007ffbc7e90000 - 0x00007ffbc8292000 	C:\WINDOWS\System32\KERNELBASE.dll
+0x00007ffbc82a0000 - 0x00007ffbc83ec000 	C:\WINDOWS\System32\ucrtbase.dll
+0x00007ffbc58b0000 - 0x00007ffbc58ce000 	C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\VCRUNTIME140.dll
+0x00007ffbc5820000 - 0x00007ffbc5838000 	C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\jli.dll
+0x00007ffbc93d0000 - 0x00007ffbc959f000 	C:\WINDOWS\System32\USER32.dll
+0x00007ffbb3a70000 - 0x00007ffbb3d00000 	C:\WINDOWS\WinSxS\amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.26100.9278_none_3e0d1ba8e3303201\COMCTL32.dll
+0x00007ffbc8980000 - 0x00007ffbc89a7000 	C:\WINDOWS\System32\win32u.dll
+0x00007ffbc8b10000 - 0x00007ffbc8bb9000 	C:\WINDOWS\System32\msvcrt.dll
+0x00007ffbc8cc0000 - 0x00007ffbc8ceb000 	C:\WINDOWS\System32\GDI32.dll
+0x00007ffbc8790000 - 0x00007ffbc88b9000 	C:\WINDOWS\System32\gdi32full.dll
+0x00007ffbc8650000 - 0x00007ffbc86f3000 	C:\WINDOWS\System32\msvcp_win.dll
+0x00007ffbc8f00000 - 0x00007ffbc8f31000 	C:\WINDOWS\System32\IMM32.DLL
+0x00007ffbc5810000 - 0x00007ffbc581c000 	C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\vcruntime140_1.dll
+0x00007ffba03b0000 - 0x00007ffba0439000 	C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\msvcp140.dll
+0x00007ffb661b0000 - 0x00007ffb66e2a000 	C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\server\jvm.dll
+0x00007ffbca9c0000 - 0x00007ffbcaa7c000 	C:\WINDOWS\System32\ADVAPI32.dll
+0x00007ffbc8a60000 - 0x00007ffbc8b09000 	C:\WINDOWS\System32\sechost.dll
+0x00007ffbca720000 - 0x00007ffbca838000 	C:\WINDOWS\System32\RPCRT4.dll
+0x00007ffbc8df0000 - 0x00007ffbc8e70000 	C:\WINDOWS\System32\WS2_32.dll
+0x00007ffbc7cf0000 - 0x00007ffbc7d4e000 	C:\WINDOWS\SYSTEM32\POWRPROF.dll
+0x00007ffbb5cb0000 - 0x00007ffbb5ce6000 	C:\WINDOWS\SYSTEM32\WINMM.dll
+0x00007ffbbdf20000 - 0x00007ffbbdf2b000 	C:\WINDOWS\SYSTEM32\VERSION.dll
+0x00007ffbc7cd0000 - 0x00007ffbc7ce5000 	C:\WINDOWS\SYSTEM32\UMPDC.dll
+0x00007ffbc6b20000 - 0x00007ffbc6b3b000 	C:\WINDOWS\SYSTEM32\kernel.appcore.dll
+0x00007ffbc57e0000 - 0x00007ffbc57ea000 	C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\jimage.dll
+0x00007ffbc5590000 - 0x00007ffbc57d2000 	C:\WINDOWS\SYSTEM32\DBGHELP.DLL
+0x00007ffbc99c0000 - 0x00007ffbc9d44000 	C:\WINDOWS\System32\combase.dll
+0x00007ffbc98e0000 - 0x00007ffbc99b9000 	C:\WINDOWS\System32\OLEAUT32.dll
+0x00007ffba0ed0000 - 0x00007ffba0f0b000 	C:\WINDOWS\SYSTEM32\dbgcore.DLL
+0x00007ffbc88c0000 - 0x00007ffbc896c000 	C:\WINDOWS\System32\bcryptPrimitives.dll
+0x00007ffbbf0d0000 - 0x00007ffbbf0f6000 	C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\java.dll
+
+dbghelp: loaded successfully - version: 4.0.5 - missing functions: none
+symbol engine: initialized successfully - sym options: 0x614 - pdb path: .;C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin;C:\WINDOWS\SYSTEM32;C:\WINDOWS\WinSxS\amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.26100.9278_none_3e0d1ba8e3303201;C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin\server
+
+VM Arguments:
+java_command: org.jetbrains.kotlin.cli.jvm.K2JVMCompiler @D:\ASELEA Work\imi new ios git push\Mac_imicode_android\app\build\20260902_2837320968954144354.compiler.options
+java_class_path (initial): C:\Users\acer\.gradle\caches\modules-2\files-2.1\org.jetbrains.kotlin\kotlin-compiler-embeddable\1.9.24\78dab849090e6c5e2eadb6e59a11cdc28fb67a08\kotlin-compiler-embeddable-1.9.24.jar;C:\Users\acer\.gradle\caches\modules-2\files-2.1\org.jetbrains.kotlin\kotlin-stdlib\1.9.0\8ee15ef0c67dc83d874f412d84378d7f0eb50b63\kotlin-stdlib-1.9.0.jar;C:\Users\acer\.gradle\caches\modules-2\files-2.1\org.jetbrains.kotlin\kotlin-script-runtime\1.9.24\96771497da90fbc5af1c90fce148db2595a62502\kotlin-script-runtime-1.9.24.jar;C:\Users\acer\.gradle\caches\modules-2\files-2.1\org.jetbrains.kotlin\kotlin-reflect\1.6.10\1cbe9c92c12a94eea200d23c2bbaedaf3daf5132\kotlin-reflect-1.6.10.jar;C:\Users\acer\.gradle\caches\modules-2\files-2.1\org.jetbrains.kotlin\kotlin-daemon-embeddable\1.9.24\86685b9c5e8d170925bd9ddbdc263374a6a73281\kotlin-daemon-embeddable-1.9.24.jar;C:\Users\acer\.gradle\caches\modules-2\files-2.1\org.jetbrains.intellij.deps\trove4j\1.0.20200330\3afb14d5f9ceb459d724e907a21145e8ff394f02\trove4j-1.0.20200330.jar;C:\Users\acer\.gradle\caches\modules-2\files-2.1\org.jetbrains.kotlin\kotlin-stdlib-common\1.9.0\cd65c21cfd1eec4d44ef09f9f52b6d9f8a720636\kotlin-stdlib-common-1.9.0.jar;C:\Users\acer\.gradle\caches\modules-2\files-2.1\org.jetbrains\annotations\13.0\919f0dfe192fb4e063e7dacadee7f8bb9a2672a9\annotations-13.0.jar
+Launcher Type: SUN_STANDARD
+
+[Global flags]
+     intx CICompilerCount                          = 4                                         {product} {ergonomic}
+     uint ConcGCThreads                            = 2                                         {product} {ergonomic}
+     uint G1ConcRefinementThreads                  = 8                                         {product} {ergonomic}
+   size_t G1HeapRegionSize                         = 2097152                                   {product} {ergonomic}
+    uintx GCDrainStackTargetSize                   = 64                                        {product} {ergonomic}
+   size_t InitialHeapSize                          = 266338304                                 {product} {ergonomic}
+   size_t MarkStackSize                            = 4194304                                   {product} {ergonomic}
+   size_t MaxHeapSize                              = 4250927104                                {product} {ergonomic}
+   size_t MinHeapDeltaBytes                        = 2097152                                   {product} {ergonomic}
+   size_t MinHeapSize                              = 8388608                                   {product} {ergonomic}
+    uintx NonNMethodCodeHeapSize                   = 5839372                                {pd product} {ergonomic}
+    uintx NonProfiledCodeHeapSize                  = 122909434                              {pd product} {ergonomic}
+    uintx ProfiledCodeHeapSize                     = 122909434                              {pd product} {ergonomic}
+    uintx ReservedCodeCacheSize                    = 251658240                              {pd product} {ergonomic}
+     bool SegmentedCodeCache                       = true                                      {product} {ergonomic}
+   size_t SoftMaxHeapSize                          = 4250927104                             {manageable} {ergonomic}
+     bool UseCompressedClassPointers               = true                           {product lp64_product} {ergonomic}
+     bool UseCompressedOops                        = true                           {product lp64_product} {ergonomic}
+     bool UseG1GC                                  = true                                      {product} {ergonomic}
+     bool UseLargePagesIndividualAllocation        = false                                  {pd product} {ergonomic}
+
+Logging:
+Log output configuration:
+ #0: stdout all=warning uptime,level,tags
+ #1: stderr all=off uptime,level,tags
+
+Environment Variables:
+JAVA_HOME=C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\
+PATH=C:\Users\acer\bin;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\usr\local\bin;C:\Program Files\Git\usr\bin;C:\Program Files\Git\usr\bin;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\usr\bin;C:\Users\acer\bin;C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot\bin;C:\Python314\Scripts;C:\Python314;C:\Program Files\Common Files\Oracle\Java\javapath;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0;C:\WINDOWS\System32\OpenSSH;C:\Program Files\Git\cmd;C:\Program Files\GitHub CLI;C:\ProgramData\chocolatey\bin;%NVM_HOME%;%NVM_SYMLINK%;C:\Program Files\Amazon\AWSCLIV2;C:\Users\acer\.local\bin;C:\Program Files\MySQL\MySQL Shell 8.0\bin;C:\Users\acer\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;C:\Users\acer\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\copilotCli;C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot\bin;C:\Program Files\Common Files\Oracle\Java\javapath;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0;C:\WINDOWS\System32\OpenSSH;C:\Program Files\Git\cmd;C:\Program Files\GitHub CLI;C:\Users\acer\AppData\Local\Microsoft\WindowsApps;C:\Users\acer\AppData\Local\Programs\Microsoft VS Code\bin;E:\JAVA JDK\jdk-25_windows-x64_bin\jdk-25.0.1\bin;C:\Program Files\Java\jdk-25\bin;C:\Program Files\Java\jdk-25;C:\Users\acer\.vscode\extensions\vscjava.vscode-java-debug-0.58.3\bundled\scripts\noConfigScripts;C:\Users\acer\AppData\Local\Pub\Cache\bin;C:\Users\acer\AppData\Roaming\npm;node_modules\npm\bin;C:\Users\acer\AppData\Roaming\npm;C:\Users\acer\platform-tools;C:\Program Files\MySQL\MySQL Server 8.0\bin;C:\Program Files\Java\jdk-25\bin;C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot\bin;C:\Users\acer\.dotnet\tools;C:\flutter\bin;C:\Users\acer\AppData\Local\nvm;C:\nvm4w\nodejs;C:\Users\acer\AppData\Local\Programs\DockerDesktop\resources\bin;C:\Program Files\Git\usr\bin\vendor_perl;C:\Program Files\Git\usr\bin\core_perl
+USERNAME=acer
+SHELL=C:\Program Files\Git\usr\bin\bash.exe
+TERM=xterm-256color
+OS=Windows_NT
+PROCESSOR_IDENTIFIER=Intel64 Family 6 Model 165 Stepping 2, GenuineIntel
+TMP=C:\Users\acer\AppData\Local\Temp
+TEMP=C:\Users\acer\AppData\Local\Temp
+
+
+
+Periodic native trim disabled
+
+
+---------------  S Y S T E M  ---------------
+
+OS:
+ Windows 11 , 64 bit Build 26100 (10.0.26100.9278)
+OS uptime: 0 days 6:59 hours
+Hyper-V role detected
+
+CPU: total 8 (initial active 8) (4 cores per cpu, 2 threads per core) family 6 model 165 stepping 2 microcode 0xea, cx8, cmov, fxsr, ht, mmx, 3dnowpref, sse, sse2, sse3, ssse3, sse4.1, sse4.2, popcnt, lzcnt, tsc, tscinvbit, avx, avx2, aes, erms, clmul, bmi1, bmi2, adx, fma, vzeroupper, clflush, clflushopt, hv
+Processor Information for the first 8 processors :
+  Max Mhz: 2496, Current Mhz: 2496, Mhz Limit: 2496
+
+Memory: 4k page, system-wide physical 16215M (300M free)
+TotalPageFile size 30493M (AvailPageFile size 20M)
+current process WorkingSet (physical memory assigned to process): 12M, peak: 12M
+current process commit charge ("private bytes"): 60M, peak: 314M
+
+vm_info: OpenJDK 64-Bit Server VM (17.0.18+8-LTS) for windows-amd64 JRE (17.0.18+8-LTS), built on Jan 15 2026 18:50:45 by "MicrosoftCorporation" with MS VC++ 17.14 (VS2022)
+
+END.

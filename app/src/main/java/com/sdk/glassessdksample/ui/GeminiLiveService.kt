@@ -377,6 +377,16 @@ class GeminiLiveService(
     private var currentOutputTranscription = StringBuilder()
     private var receivedAudioInCurrentTurn = false
     private var hasTranscriptionForCurrentTurn = false
+
+    // Set when a tool runs during this turn. Gemini sometimes ends a turn straight
+    // after a tool response without speaking - the tool data comes back fine, the
+    // model just never narrates it, so the user is left waiting for a reply that
+    // never arrives. Tracked so an empty turn can be retried once (see
+    // recoverFromSilentTurn); reset with the other per-turn flags.
+    private var toolCallInCurrentTurn = false
+    private var lastToolResultSummary: String? = null
+    // Guards the retry so a model that stays silent cannot loop forever.
+    private var silentTurnRetried = false
     
     // Audio playback queue
     private val audioQueue = mutableListOf<ByteArray>()
@@ -1049,8 +1059,9 @@ class GeminiLiveService(
         if (!HIGH_QUALITY_PLAYBACK) return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
         try {
-            val a2dp = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
+            val a2dp = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.let {
+                PreferredAudioDeviceResolver.findGlasses(context, it, AudioDeviceInfo.TYPE_BLUETOOTH_A2DP)
+            }
             if (a2dp != null) {
                 val ok = audioTrack?.setPreferredDevice(a2dp)
                 Log.d(TAG, "🎯 Playback re-pinned → ${a2dp.productName} [A2DP], success=$ok")
@@ -1136,8 +1147,9 @@ class GeminiLiveService(
                 Log.d(TAG, "🎧 Communication device already on Bluetooth SCO (${current.productName})")
                 return true
             }
-            val bt = am.availableCommunicationDevices
-                .firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            val bt = PreferredAudioDeviceResolver.findGlasses(
+                context, am.availableCommunicationDevices, AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            )
             if (bt == null) {
                 Log.w(TAG, "⚠️ No Bluetooth SCO communication device offered by the system — " +
                         "the glasses may not expose HFP, or are not connected as a headset")
@@ -1397,11 +1409,13 @@ class GeminiLiveService(
                     Log.d(TAG, "   - ${dev.productName}: $typeStr")
                 }
                 
-                // Find and prefer Bluetooth SCO device
-                val bluetoothDevice = devices.firstOrNull { 
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO 
-                }
-                
+                // Find and prefer the paired glasses' Bluetooth SCO device specifically —
+                // not just any Bluetooth SCO device, in case a second BT accessory is
+                // also connected (see PreferredAudioDeviceResolver).
+                val bluetoothDevice = PreferredAudioDeviceResolver.findGlasses(
+                    context, devices, AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                )
+
                 if (bluetoothDevice != null) {
                     val success = audioRecord?.setPreferredDevice(bluetoothDevice)
                     Log.d(TAG, "🎯 Set preferred device to: ${bluetoothDevice.productName}, success=$success")
@@ -1482,12 +1496,12 @@ class GeminiLiveService(
             try {
                 val outputDevices = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: arrayOf()
 
-                val a2dpDevice = outputDevices.firstOrNull {
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
-                }
-                val scoDevice = outputDevices.firstOrNull {
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                }
+                val a2dpDevice = PreferredAudioDeviceResolver.findGlasses(
+                    context, outputDevices, AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                )
+                val scoDevice = PreferredAudioDeviceResolver.findGlasses(
+                    context, outputDevices, AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                )
 
                 val chosen = if (HIGH_QUALITY_PLAYBACK && a2dpDevice != null) a2dpDevice else scoDevice
 
@@ -1628,10 +1642,15 @@ class GeminiLiveService(
                 // Transient hiccup (Gemini occasionally drops the socket mid-setup
                 // or right after connecting). Previously the user had to manually
                 // "quick start" again; instead, silently re-establish the session a
-                // couple of times before surfacing any error. Auth/config problems
-                // are not transient, so don't retry those.
+                // couple of times before surfacing any error. Auth/quota/billing
+                // problems are not transient, so don't retry those - a suspended key
+                // will fail identically on every retry, and retrying just delayed and
+                // muddied the real error (see errorMessage below).
                 val isAuthError = response?.code == 401 || response?.code == 403 ||
-                    t.message?.contains("401", ignoreCase = true) == true
+                    response?.code == 429 ||
+                    t.message?.contains("401", ignoreCase = true) == true ||
+                    t.message?.contains("403", ignoreCase = true) == true ||
+                    t.message?.contains("429", ignoreCase = true) == true
                 if (!isAuthError && autoReconnects < MAX_AUTO_RECONNECTS) {
                     autoReconnects++
                     Log.w(TAG, "⚠️ Connection dropped, auto-reconnecting (attempt $autoReconnects/$MAX_AUTO_RECONNECTS)")
@@ -1650,12 +1669,27 @@ class GeminiLiveService(
                     return
                 }
 
+                // Distinguishes "no network" from "the server refused us", which used
+                // to collapse into one generic "Connection failed" message that never
+                // named the actual HTTP status - so a 429 quota rejection and a 401
+                // revoked key both looked identical to a dropped WiFi connection, and
+                // the (previously mislabelled "Invalid OpenAI API Key") 401 branch
+                // fired for Gemini too since it only checked the message text, not
+                // which provider was active.
+                val providerLabel = if (activeProvider == ModelProvider.GPT_REALTIME) "OpenAI" else "Gemini"
                 val errorMessage = when {
+                    response?.code == 429 ->
+                        "$providerLabel API quota exceeded — check billing/usage limits (429: $responseBody)"
+                    response?.code == 401 ->
+                        "$providerLabel API key rejected as invalid (401: $responseBody)"
+                    response?.code == 403 ->
+                        "$providerLabel API key lacks permission or billing is not enabled (403: $responseBody)"
+                    response?.code != null ->
+                        "$providerLabel connection rejected (${response.code}: $responseBody)"
                     t.message?.contains("network", ignoreCase = true) == true -> "Network disconnected"
                     t.message?.contains("internet", ignoreCase = true) == true -> "No internet connection"
                     t.message?.contains("connection", ignoreCase = true) == true -> "Connection lost"
                     t.message?.contains("timeout", ignoreCase = true) == true -> "Connection timeout"
-                    t.message?.contains("401", ignoreCase = true) == true -> "Invalid OpenAI API Key"
                     else -> "Connection failed: ${t.message}"
                 }
                 
@@ -1719,6 +1753,34 @@ class GeminiLiveService(
                     // just sees the screen close with no answer and no explanation.
                     Log.e(TAG, "❌ Gemini Live rejected the session setup ($code: $reason)")
                     callbacks.onError("AI rejected the session setup: $reason")
+                } else if (code != 1000) {
+                    // Any other non-clean close (clean = 1000, the normal end-of-turn
+                    // shutdown this app itself requests) used to fall straight through
+                    // to cleanup() with nothing reported. That is exactly what a quota
+                    // exhaustion, billing suspension, or revoked-key rejection looks
+                    // like from the server: it can close the frame with a code other
+                    // than 1007 instead of failing the handshake, so it never hit
+                    // onFailure's error handling either. The user just saw the session
+                    // end with no explanation - indistinguishable from a normal stop.
+                    //
+                    // 1008 = policy violation, 1011 = internal error: Gemini uses both
+                    // for auth/quota/billing rejections depending on where in the
+                    // pipeline the request was refused. Log the reason text too, since
+                    // that is where "quota", "billing" or "permission" actually shows.
+                    val looksLikeAccessProblem = code == 1008 || code == 1011 ||
+                        reason.contains("quota", ignoreCase = true) ||
+                        reason.contains("billing", ignoreCase = true) ||
+                        reason.contains("permission", ignoreCase = true) ||
+                        reason.contains("exhausted", ignoreCase = true) ||
+                        reason.contains("suspended", ignoreCase = true)
+
+                    val message = if (looksLikeAccessProblem) {
+                        "AI unavailable — the API key may be out of quota, unbilled, or revoked ($code: ${reason.ifBlank { "no reason given" }})"
+                    } else {
+                        "AI session ended unexpectedly ($code: ${reason.ifBlank { "no reason given" }})"
+                    }
+                    Log.e(TAG, "❌ $message")
+                    callbacks.onError(message)
                 }
 
                 callbacks.onConnectionStatusChanged(false)
@@ -2846,6 +2908,22 @@ $visionInstruction"""
                     stopThinkingSound()
                     val fullInput = currentInputTranscription.toString()
                     val fullOutput = currentOutputTranscription.toString()
+
+                    // Gemini can close a turn having produced no audio and no text -
+                    // most often right after a tool response, where it treats the tool
+                    // result as the whole answer. Nothing plays and the user waits for
+                    // a reply that never comes, until the 10s session fallback fires.
+                    // Detect it here and ask once for the answer to actually be spoken.
+                    val producedNothing = !receivedAudioInCurrentTurn &&
+                        !hasTranscriptionForCurrentTurn &&
+                        fullOutput.isBlank()
+                    if (producedNothing && !interrupted && recoverFromSilentTurn(fullInput)) {
+                        // Retry sent: keep the turn's transcripts so the recovered
+                        // reply is reported against the question the user actually
+                        // asked, and do not signal turn-complete yet.
+                        return
+                    }
+
                     callbacks.onTranscriptionUpdate(fullInput, fullOutput, true)
                     if (fullInput.isNotEmpty()) {
                         visionTranscriptionListener?.onUserTranscription(fullInput, true)
@@ -2855,6 +2933,9 @@ $visionInstruction"""
                     currentOutputTranscription.clear()
                     receivedAudioInCurrentTurn = false
                     hasTranscriptionForCurrentTurn = false
+                    toolCallInCurrentTurn = false
+                    lastToolResultSummary = null
+                    silentTurnRetried = false
                 }
                 return
             }
@@ -2870,10 +2951,14 @@ $visionInstruction"""
                     val args = fcMap["args"] as? Map<String, Any> ?: emptyMap()
                     
                     Log.d(TAG, "🔧 Gemini function call: $name, args: $args")
+                    toolCallInCurrentTurn = true
                     scope.launch {
                         try {
                             val result = callbacks.onToolCall(name, args)
                             Log.d(TAG, "✅ Gemini function $name result: $result")
+                            // Kept so a turn that ends without narration can still be
+                            // salvaged from the data the tool already fetched.
+                            lastToolResultSummary = result
                             sendGeminiFunctionResponse(id, name, result)
                         } catch (e: Exception) {
                             Log.e(TAG, "❌ Error executing Gemini function $name: ${e.message}")
@@ -2897,6 +2982,58 @@ $visionInstruction"""
         }
     }
     
+    /**
+     * Salvages a turn that ended with no spoken reply.
+     *
+     * Gemini occasionally completes a turn after a tool response without narrating
+     * the result. The data is present and correct - it simply never gets spoken, so
+     * the user hears silence and the session eventually force-stops. Rather than
+     * leaving that dead air, ask the model once to say the answer.
+     *
+     * Only ever retries once per turn: if the model stays silent after being asked
+     * directly, retrying again would just repeat the silence. When a tool did run,
+     * its result is included so the answer can be given even if the model has lost
+     * the thread of it.
+     *
+     * @return true if a retry was sent and the turn should stay open.
+     */
+    private fun recoverFromSilentTurn(userInput: String): Boolean {
+        if (silentTurnRetried) {
+            Log.w(TAG, "⚠️ Turn produced no reply again after retry - giving up on this turn")
+            return false
+        }
+        // A turn with no user speech is usually a stray/empty model turn rather
+        // than a failed answer; nudging there would speak into a silent room.
+        if (userInput.isBlank() && !toolCallInCurrentTurn) {
+            return false
+        }
+        if (webSocket == null || !isSetupComplete.get()) {
+            Log.w(TAG, "⚠️ Silent turn but session is not ready - cannot retry")
+            return false
+        }
+
+        silentTurnRetried = true
+        val toolResult = lastToolResultSummary
+
+        val prompt = if (toolCallInCurrentTurn && !toolResult.isNullOrBlank()) {
+            Log.w(TAG, "⚠️ Silent turn after tool call - asking Gemini to speak the result")
+            "You called a tool and received this result but did not reply to the user. " +
+                "Answer their question now in 1-2 short sentences using this information, " +
+                "speaking naturally and without mentioning tools or this instruction. " +
+                "Question: \"$userInput\". Information: $toolResult"
+        } else {
+            Log.w(TAG, "⚠️ Silent turn with no reply - asking Gemini to answer")
+            "You did not reply to the user. Answer their question now in 1-2 short " +
+                "sentences, speaking naturally and without mentioning this instruction. " +
+                "If you cannot answer, say so briefly. Question: \"$userInput\""
+        }
+
+        // speakDirectly=false: this is an instruction to answer, not a script to
+        // read aloud verbatim.
+        speakText(prompt, speakDirectly = false)
+        return true
+    }
+
     /**
      * Send function response back to Gemini Live
      */

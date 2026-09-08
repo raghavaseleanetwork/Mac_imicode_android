@@ -41,6 +41,7 @@ import com.sdk.glassessdksample.databinding.ActivityDeviceBindBinding
 import org.greenrobot.eventbus.EventBus
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 class DeviceBindActivity : BaseActivity() {
 
@@ -221,6 +222,7 @@ class DeviceBindActivity : BaseActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityDeviceBindBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        SystemBarsInsets.apply(this)
     }
 
     override fun setupViews() {

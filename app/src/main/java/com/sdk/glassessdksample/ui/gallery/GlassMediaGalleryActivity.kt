@@ -43,6 +43,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.net.InetSocketAddress
 import java.net.Socket
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 
 /**
@@ -208,6 +209,7 @@ class GlassMediaGalleryActivity : AppCompatActivity(),
         
         // Use XML layout instead of programmatic creation
         setContentView(R.layout.activity_glass_media_gallery)
+        SystemBarsInsets.apply(this)
         
         // Initialize views from layout
         recyclerView = findViewById(R.id.recyclerView)

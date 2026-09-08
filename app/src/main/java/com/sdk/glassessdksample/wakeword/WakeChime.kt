@@ -1,9 +1,8 @@
 package com.sdk.glassessdksample.wakeword
 
 import android.content.Context
-import android.media.MediaPlayer
 import android.util.Log
-import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.WakeChimePlayer
 
 /**
  * Shared wake-acknowledgment chime used by every wake-word engine.
@@ -13,20 +12,32 @@ import com.sdk.glassessdksample.R
  * this project. Every detection therefore fell through to a synthesized
  * ToneGenerator beep. Loading lives here now so the engines cannot drift apart.
  *
- * Sourced from R.raw.wake_chime — the same resource MainActivity, Mark1MainActivity
- * and ListeningService play, so there is exactly one wake sound in the app.
+ * Playback delegates to [WakeChimePlayer], the single implementation shared with
+ * MainActivity, Mark1MainActivity and ListeningService.
+ *
+ * This used to hand each detector its own MediaPlayer. A detector fires while SCO
+ * is already held for the glasses mic (A2DP suspended for the life of that link),
+ * and MediaPlayer's default media-stream output against that MODE_IN_COMMUNICATION
+ * session was accepted by the OS but rendered to a suspended or re-routing path —
+ * silent on many phones, with nothing in the logs. MediaPlayer.create() also
+ * decoded synchronously on the detector's audio thread, which both stalled
+ * detection and lost the chime entirely when the decode outlived the player.
  */
 object WakeChime {
 
     private const val TAG = "WakeChime"
 
     /**
-     * Build a MediaPlayer for the wake chime, or null if it cannot be loaded.
-     * Callers own the returned player and must release() it.
+     * Warm the shared chime so the first detection plays instantly.
+     *
+     * Kept for call-site compatibility with the detectors, which used to own a
+     * MediaPlayer each. There is no per-caller player any more, so the return
+     * value is only a "did it load" hint and nothing needs releasing.
      */
-    fun createPlayer(context: Context): MediaPlayer? {
+    fun createPlayer(context: Context): Context? {
         return try {
-            MediaPlayer.create(context, R.raw.wake_chime)?.apply { setVolume(1f, 1f) }
+            WakeChimePlayer.preload(context)
+            context
         } catch (e: Exception) {
             Log.w(TAG, "Chime preload failed: ${e.message}")
             null
@@ -34,16 +45,14 @@ object WakeChime {
     }
 
     /**
-     * Play the chime, restarting it if it is already sounding.
+     * Play the chime. Safe to call from a detector's audio thread.
      *
-     * Deliberately silent when [player] is null: the previous ToneGenerator
+     * Deliberately silent when [context] is null: the previous ToneGenerator
      * fallback produced the electronic beep this was meant to replace.
      */
-    fun play(player: MediaPlayer?, tag: String = TAG) {
+    fun play(context: Context?, tag: String = TAG) {
         try {
-            player?.let { p ->
-                if (p.isPlaying) p.seekTo(0) else p.start()
-            }
+            context?.let { WakeChimePlayer.play(it) }
         } catch (e: Exception) {
             Log.w(tag, "Chime play failed: ${e.message}")
         }

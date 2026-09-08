@@ -10,6 +10,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Shows ALL of the user's recorded meetings (not just today's).
@@ -26,6 +27,7 @@ class AllMeetingMinutesActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_all_meeting_minutes)
+        SystemBarsInsets.apply(this)
 
         meetingManager = MeetingMinutesManager(this)
 

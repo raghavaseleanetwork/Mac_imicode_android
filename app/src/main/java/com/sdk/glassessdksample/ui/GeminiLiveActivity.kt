@@ -13,6 +13,7 @@ import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.sdk.glassessdksample.R
+import com.sdk.glassessdksample.utils.SystemBarsInsets
 
 /**
  * Example Activity demonstrating how to use GeminiLiveService
@@ -45,6 +46,7 @@ class GeminiLiveActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCall
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_gemini_live)
+        SystemBarsInsets.apply(this)
         
         // Initialize the service
         geminiLiveService = GeminiLiveService(this, this)
