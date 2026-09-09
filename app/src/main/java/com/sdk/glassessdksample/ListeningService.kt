@@ -232,7 +232,7 @@ class ListeningService : Service() {
             return START_STICKY
         }
 
-        try { HotHelper.getInstance(applicationContext).start() } catch (_: Exception) {}
+        try { HotHelper.getInstance(applicationContext).armOnGlassMic() } catch (_: Exception) {}
 
         return START_STICKY
     }
@@ -257,7 +257,7 @@ class ListeningService : Service() {
                     Log.i(TAG, "🎤 Meeting recording in progress — abandoning deferred wake-word arm")
                     return
                 }
-                try { HotHelper.getInstance(applicationContext).start() } catch (_: Exception) {}
+                try { HotHelper.getInstance(applicationContext).armOnGlassMic() } catch (_: Exception) {}
                 Log.i(TAG, "🔁 Wake word armed now that the vision window has closed")
             }
         }, VISION_ARM_POLL_MS)
@@ -466,7 +466,7 @@ class ListeningService : Service() {
             }
             if (!bgConversationActive) {
                 wakeWordEnabled = true
-                try { HotHelper.getInstance(applicationContext).start() } catch (_: Exception) {}
+                try { HotHelper.getInstance(applicationContext).armOnGlassMic() } catch (_: Exception) {}
                 Log.i(TAG, "🔁 Wake word re-armed ($reason)")
             }
         }, REARM_DELAY_MS)
@@ -593,6 +593,9 @@ class ListeningService : Service() {
                 "stock_quote" -> bgStockQuote(args)
                 "get_news" -> bgWebSearch(mapOf("query" to (args["topic"] as? String ?: "top news today")))
                 "create_note" -> bgCreateNote(args)
+                "delete_note" ->
+                    "I can't delete notes by voice. Open Quick Notes and delete it there — " +
+                        "tap and hold a note, or open it and tap the delete icon."
                 "make_phone_call" -> bgPhoneCall(args)
                 "get_directions", "open_maps" -> bgDirections(args)
                 "read_notifications" -> bgReadNotifications()

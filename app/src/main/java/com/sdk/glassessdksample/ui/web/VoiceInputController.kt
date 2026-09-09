@@ -16,10 +16,11 @@ import java.util.Locale
 /**
  * Speech-to-text for the Web section's command bar.
  *
- * Follows the same recognizer setup the app already uses in `ChatActivity`,
- * including its most important lesson: the inline recognizer fails often and
- * for boring reasons (busy, no match, client error), so recoverable failures
- * fall back to the system speech dialog rather than showing the user an error.
+ * Follows the same recognizer setup the app already uses in `ChatActivity`.
+ * Recoverable failures (busy, no match, silence) just reset back to idle
+ * rather than surfacing an error - see [start] for the hard timeout that
+ * guarantees that reset happens even on OEM recognizers that ignore the
+ * requested silence-length extras.
  */
 class VoiceInputController(
     private val activity: Activity,
@@ -38,12 +39,11 @@ class VoiceInputController(
 
         /** Recognition failed in a way the user should hear about. */
         fun onError(message: String)
-
-        /** The inline recognizer gave up; open the system dialog instead. */
-        fun onFallbackToSystemDialog(intent: Intent)
     }
 
     private var recognizer: SpeechRecognizer? = null
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val watchdogToken = Any()
 
     var isListening: Boolean = false
         private set
@@ -86,15 +86,19 @@ class VoiceInputController(
                     Log.w(TAG, "Speech error $error")
                     activity.runOnUiThread {
                         setListening(false)
-                        // These are the everyday failures — retrying through the
-                        // system dialog works far more often than reporting them.
+                        // These are the everyday failures (mic caught silence,
+                        // a short timeout, the recognizer service hiccupped).
+                        // This used to fall back to launching Android's SEPARATE
+                        // full-screen system speech dialog on top of the inline
+                        // mic - to the user that looked like "two mics": the
+                        // normal in-app one, then an unexplained second
+                        // listening popup appearing on its own. Instead, just
+                        // let the user tap the mic again - one experience only.
                         val recoverable = error == SpeechRecognizer.ERROR_NO_MATCH ||
                             error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
                             error == SpeechRecognizer.ERROR_CLIENT ||
                             error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
-                        if (recoverable) {
-                            listener.onFallbackToSystemDialog(buildIntent(partial = false))
-                        } else {
+                        if (!recoverable) {
                             listener.onError(errorMessage(error))
                         }
                     }
@@ -124,7 +128,7 @@ class VoiceInputController(
             })
         }
 
-        return try {
+        val started = try {
             recognizer?.startListening(buildIntent(partial = true))
             true
         } catch (e: Exception) {
@@ -133,10 +137,25 @@ class VoiceInputController(
             listener.onError("Couldn't start voice input.")
             false
         }
+
+        if (started) {
+            // Some OEM speech services (seen on this device's recognizer)
+            // don't honor EXTRA_SPEECH_INPUT_*_SILENCE_LENGTH_MILLIS and can
+            // sit "listening" far longer than the ~2s of silence that should
+            // have ended it - the mic just stays open with nothing
+            // happening. This is a hard backstop, independent of whatever
+            // the recognizer itself does: if nothing has closed the mic on
+            // its own well past what any real utterance needs, force it
+            // closed so the UI never gets stuck open.
+            mainHandler.postDelayed({ stop() }, watchdogToken, HARD_TIMEOUT_MS)
+        }
+
+        return started
     }
 
     /** Stops listening without discarding what has been heard so far. */
     fun stop() {
+        mainHandler.removeCallbacksAndMessages(watchdogToken)
         if (!isListening) return
         try {
             recognizer?.stopListening()
@@ -147,6 +166,7 @@ class VoiceInputController(
 
     /** Releases the recognizer. Call from the Activity's onDestroy. */
     fun release() {
+        mainHandler.removeCallbacksAndMessages(watchdogToken)
         try {
             recognizer?.destroy()
         } catch (_: Exception) {
@@ -187,10 +207,15 @@ class VoiceInputController(
     companion object {
         private const val TAG = "VoiceInputController"
 
+        /**
+         * Hard backstop so the mic can never stay "listening" indefinitely on
+         * a recognizer that ignores the requested silence-length extras. Well
+         * past what a real spoken command needs, short of what would feel
+         * like the app itself has stopped responding.
+         */
+        private const val HARD_TIMEOUT_MS = 6000L
+
         /** Permission request code, also used by the Activity's callback. */
         const val REQ_AUDIO = 9701
-
-        /** Request code for the system speech dialog fallback. */
-        const val REQ_SYSTEM_SPEECH = 9702
     }
 }

@@ -74,6 +74,17 @@ object VoiceCommandInterpreter {
             return GlassAction.GET_NEWS to text
         }
 
+        if (text.contains("search the web for") || text.contains("search web for") || text.contains("search the web") || text.contains("search for") || text.startsWith("search")) {
+            val query = text
+                .replace("search the web for", "")
+                .replace("search web for", "")
+                .replace("search the web", "")
+                .replace("search for", "")
+                .replace("search", "")
+                .trim()
+            return GlassAction.SEARCH_WEB to query
+        }
+
         if (text.contains("where am i") || text.contains("my location")) {
             return GlassAction.TRACK_LOCATION to ""
         }

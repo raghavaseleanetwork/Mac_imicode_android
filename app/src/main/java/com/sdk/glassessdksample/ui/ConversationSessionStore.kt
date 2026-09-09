@@ -135,4 +135,12 @@ object ConversationSessionStore {
             .edit().remove(KEY_SESSIONS).apply()
         com.sdk.glassessdksample.ui.sync.ConversationSync.pushClearAll(context)
     }
+
+    /** Delete one session (a single conversation thread) without touching the rest. */
+    fun deleteSession(context: Context, sessionId: String) {
+        val sessions = getSessions(context)
+        if (sessions.removeAll { it.id == sessionId }) {
+            save(context, sessions)
+        }
+    }
 }

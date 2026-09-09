@@ -845,6 +845,7 @@
                     android:layout_marginBottom="4dp">
 
                     <TextView
+                        android:id="@+id/tvBleGateHeadline"
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
@@ -867,6 +868,7 @@
                 </LinearLayout>
 
                 <TextView
+                    android:id="@+id/tvBleGateTitle"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="connected."
@@ -877,6 +879,7 @@
                     android:layout_marginBottom="12dp" />
 
                 <TextView
+                    android:id="@+id/tvBleGateDescription"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="Connect your IMI glasses via your phone's Bluetooth settings, then tap Retry."

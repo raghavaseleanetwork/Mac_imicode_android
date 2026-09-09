@@ -39,9 +39,21 @@ object ActionValidator {
     )
 
     fun validate(action: BrowserAction, page: PageReader.PageSnapshot?): Verdict {
-        // A CAPTCHA stops everything except explicitly handing over.
-        if (page?.hasCaptcha == true && action !is BrowserAction.HandoffToUser &&
-            action !is BrowserAction.Done && action !is BrowserAction.Failed
+        // A CAPTCHA stops everything that would interact with THIS page —
+        // typing, clicking, scrolling. It must NOT stop navigating away
+        // (Open/Search): the whole point of those actions is leaving the
+        // stuck page, so they need no interaction with what's blocking it.
+        // Without this exemption, a goal as simple as "open YouTube" could
+        // never proceed if the browser merely happened to be sitting on some
+        // other, unrelated page that has a CAPTCHA/login wall on it — the
+        // agent would report itself stuck before it ever got a chance to
+        // navigate to the site the user actually asked for.
+        if (page?.hasCaptcha == true &&
+            action !is BrowserAction.HandoffToUser &&
+            action !is BrowserAction.Done &&
+            action !is BrowserAction.Failed &&
+            action !is BrowserAction.Open &&
+            action !is BrowserAction.Search
         ) {
             return Verdict.Handoff(
                 "This page is asking for a CAPTCHA. Please solve it, then tap Continue."

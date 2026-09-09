@@ -101,24 +101,6 @@ class ChatActivity : AppCompatActivity() {
     private var speechRecognizer: android.speech.SpeechRecognizer? = null
     private var isListening = false
 
-    // System speech-to-text dialog (reliable fallback / primary on flaky devices)
-    private val speechLauncher = registerForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        showListeningUi(false)
-        if (result.resultCode == RESULT_OK) {
-            val spoken = result.data
-                ?.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS)
-                ?.firstOrNull()
-                .orEmpty()
-            if (spoken.isNotBlank()) {
-                etChatInput.setText(spoken)
-                etChatInput.setSelection(etChatInput.text.length)
-                sendMessage()
-            }
-        }
-    }
-
     // Pick an image from the gallery, copy it locally, then analyze inline.
     private val galleryPickLauncher = registerForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
@@ -201,7 +183,7 @@ class ChatActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_chat)
         SystemBarsInsets.apply(this)
-        
+
         initViews()
         initServices()
         loadConversations()
@@ -210,6 +192,7 @@ class ChatActivity : AppCompatActivity() {
         setupClickListeners()
         setupBottomNav()
         registerImageReceiver()
+        setupComposerImeInset()
         
         // Create or load first conversation
         if (conversations.isEmpty()) {
@@ -256,6 +239,55 @@ class ChatActivity : AppCompatActivity() {
         prefs = getSharedPreferences("IMI_CHAT_PREFS", MODE_PRIVATE)
 
         setupGreetingAndSuggestions()
+    }
+
+    /**
+     * Keeps the "Ask AI" composer bar and the bottom nav above the on-screen
+     * keyboard.
+     *
+     * Same underlying bug as the Web browser's command bar (see that fix for
+     * the on-screen-keyboard overlap): [SystemBarsInsets.apply] turns on
+     * edge-to-edge drawing for the whole window, which makes the app
+     * responsible for consuming the IME inset itself — nothing here was
+     * doing that, so the keyboard simply painted over the composer bar and
+     * bottom nav instead of pushing them up.
+     *
+     * Adjusting an individual child's MARGIN does not work here, and two
+     * earlier attempts at that both looked broken on screen: margin only
+     * reserves blank space around the one view it is set on, it does not
+     * move that view's later siblings. Growing the composer's margin left a
+     * dead gap under the composer while `bottomNavigation` — the next
+     * sibling — stayed put under the keyboard; and `bottomNavigation`'s own
+     * margin is already owned by [SystemBarsInsets], which rewrites it on
+     * every insets dispatch.
+     *
+     * Padding the CONTENT COLUMN is the actual fix. The screen is one
+     * vertical LinearLayout (top bar, then a weighted message list, then the
+     * composer, then the nav bar) filling the window. Bottom padding on that
+     * column shrinks the space its children share; the message list is the
+     * only weighted child, so it alone gives up the height, and the composer
+     * and nav bar below it both ride up together — flush above the keyboard,
+     * no gap, nothing hidden.
+     *
+     * Safe to own this view's padding: [SystemBarsInsets] operates on
+     * `android.R.id.content`'s first child, which on this screen is the
+     * DrawerLayout wrapping this column, and it only touches
+     * `bottomNavigation`'s margin from there — never this column's padding.
+     */
+    private fun setupComposerImeInset() {
+        val content = findViewById<View>(R.id.layoutChatContent)
+        val basePaddingBottom = content.paddingBottom
+
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
+            val imeHeight = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime()).bottom
+            view.setPadding(
+                view.paddingLeft,
+                view.paddingTop,
+                view.paddingRight,
+                basePaddingBottom + imeHeight
+            )
+            insets
+        }
     }
 
     /** Greeting uses the stored profile name; suggestions prefill the composer. */
@@ -332,16 +364,25 @@ class ChatActivity : AppCompatActivity() {
                 override fun onError(error: Int) {
                     Log.w(TAG, "Speech onError: $error (${speechErrorMessage(error)})")
                     runOnUiThread {
-                        // When the inline recognizer can't hear / mis-binds, fall back
-                        // to the system speech dialog which is far more reliable.
+                        // These are the everyday, harmless cases (mic caught
+                        // silence, a short pause, the recognizer service
+                        // hiccupped) - not real failures. This used to launch
+                        // Android's own SEPARATE system speech-recognition
+                        // dialog on top of the inline mic whenever one of them
+                        // fired, which is what showed as "a box with an error
+                        // message" - that's the system dialog's own UI (it
+                        // shows its own "Didn't catch that"/error state on
+                        // launch when conditions are still bad), appearing
+                        // unexpectedly on top of the mic the user had just
+                        // tapped. Just reset to idle instead - one mic
+                        // experience only, same fix already applied to the Web
+                        // browser and Quick Notes mics.
                         val recoverable = error == android.speech.SpeechRecognizer.ERROR_NO_MATCH ||
                             error == android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
                             error == android.speech.SpeechRecognizer.ERROR_CLIENT ||
                             error == android.speech.SpeechRecognizer.ERROR_RECOGNIZER_BUSY
-                        if (recoverable) {
-                            launchSystemSpeechDialog()
-                        } else {
-                            showListeningUi(false)
+                        showListeningUi(false)
+                        if (!recoverable) {
                             Toast.makeText(this@ChatActivity, speechErrorMessage(error), Toast.LENGTH_SHORT).show()
                         }
                     }
@@ -450,30 +491,6 @@ class ChatActivity : AppCompatActivity() {
             galleryPickLauncher.launch(intent)
         } catch (e: Exception) {
             Toast.makeText(this, "Could not open gallery", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    /** Reliable system speech-to-text dialog (Google's own recognizer UI). */
-    private fun launchSystemSpeechDialog() {
-        try { speechRecognizer?.cancel() } catch (_: Exception) {}
-        try { speechRecognizer?.destroy() } catch (_: Exception) {}
-        speechRecognizer = null
-
-        val intent = android.content.Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(
-                android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-            )
-            putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, java.util.Locale.getDefault().toString())
-            putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT, "Speak now")
-            putExtra(android.speech.RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-        }
-        try {
-            speechLauncher.launch(intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "System speech dialog failed", e)
-            showListeningUi(false)
-            Toast.makeText(this, "Voice input not available on this device", Toast.LENGTH_SHORT).show()
         }
     }
 

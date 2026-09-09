@@ -111,12 +111,6 @@ class ProfileActivity : AppCompatActivity() {
             finish()
         }
 
-        // Edit profile button
-        binding.editProfileButton.setOnClickListener {
-            // Open user memory activity for editing
-            startActivity(Intent(this, UserMemoryActivity::class.java))
-        }
-
         // Switch Device (Mark 1 / Mark 2)
         binding.switchDeviceButton.setOnClickListener {
             showSwitchDeviceDialog()

@@ -276,6 +276,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private val REQUEST_RECORD_AUDIO_CODE = 201
     private val REQUEST_READ_CONTACTS = 302
     private val REQUEST_CALL_PHONE = 303
+    private var pendingContactCallName: String? = null
     private val REQUEST_BLUETOOTH_CONNECT = 401
     private val REQUEST_POST_NOTIFICATIONS = 501
     private val REQUEST_BACKGROUND_LISTENING = 502
@@ -1102,7 +1103,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             REQUEST_READ_CONTACTS -> {
                 if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                     Toast.makeText(this, "Contacts access granted", Toast.LENGTH_SHORT).show()
+                    // Resume the call that was waiting on this permission, if any.
+                    pendingContactCallName?.let { name ->
+                        pendingContactCallName = null
+                        lookupAndCall(name)
+                    }
                 } else {
+                    pendingContactCallName = null
                     speakOut("Contacts permission denied. Can't access phonebook.", "ERROR")
                 }
             }
@@ -3917,6 +3924,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // Check for contacts permission
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
             speakOut("I need contacts permission to find $contactName", "ERROR")
+            pendingContactCallName = contactName
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_CONTACTS), REQUEST_READ_CONTACTS)
             return
         }
@@ -3941,64 +3949,104 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
     
+    /**
+     * Finds the contact whose name is the closest match to what was spoken,
+     * instead of relying on an exact SQL substring match. Voice transcription of a
+     * name is rarely spelled exactly like the saved contact (e.g. "Ayush" spoken
+     * for a contact saved as "Ayushi", or minor mis-transcriptions), so this loads
+     * every contact once and scores each by name similarity, picking the closest.
+     */
     private fun findContactPhoneNumber(name: String): String? {
+        val spoken = name.trim().lowercase()
+        if (spoken.isEmpty()) return null
+
+        data class Candidate(val displayName: String, val number: String)
+        val candidates = mutableListOf<Candidate>()
+
         try {
-            // Try exact match first (case insensitive)
-            var cursor = contentResolver.query(
+            contentResolver.query(
                 ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
                 arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME),
-                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
-                arrayOf("%$name%"),
-                null
-            )
-            
-            cursor?.use {
-                if (it.moveToFirst()) {
-                    val phoneIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
-                    val nameIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
-                    if (phoneIndex >= 0 && nameIndex >= 0) {
-                        val foundName = it.getString(nameIndex)
-                        val foundNumber = it.getString(phoneIndex)
-                        Log.d(TAG, "✅ Found contact: $foundName -> $foundNumber")
-                        return foundNumber
-                    }
-                }
-            }
-            
-            // Try searching first name or last name separately
-            val nameParts = name.split(" ")
-            if (nameParts.size > 1) {
-                for (part in nameParts) {
-                    if (part.length >= 2) {
-                        cursor = contentResolver.query(
-                            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME),
-                            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
-                            arrayOf("%$part%"),
-                            null
-                        )
-                        
-                        cursor?.use {
-                            if (it.moveToFirst()) {
-                                val phoneIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
-                                val nameIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
-                                if (phoneIndex >= 0 && nameIndex >= 0) {
-                                    val foundName = it.getString(nameIndex)
-                                    val foundNumber = it.getString(phoneIndex)
-                                    Log.d(TAG, "✅ Found contact by partial match: $foundName -> $foundNumber")
-                                    return foundNumber
-                                }
-                            }
-                        }
-                    }
+                null, null, null
+            )?.use { cursor ->
+                val phoneIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                val nameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                if (phoneIndex < 0 || nameIndex < 0) return null
+                while (cursor.moveToNext()) {
+                    val displayName = cursor.getString(nameIndex) ?: continue
+                    val number = cursor.getString(phoneIndex) ?: continue
+                    candidates.add(Candidate(displayName, number))
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error searching contacts: ${e.message}", e)
+            return null
         }
-        
-        Log.w(TAG, "❌ No contact found for: $name")
-        return null
+
+        if (candidates.isEmpty()) {
+            Log.w(TAG, "❌ No contacts available to match against")
+            return null
+        }
+
+        // Exact (case-insensitive) full-name match wins outright.
+        candidates.firstOrNull { it.displayName.equals(spoken, ignoreCase = true) }?.let {
+            Log.d(TAG, "✅ Exact contact match: ${it.displayName} -> ${it.number}")
+            return it.number
+        }
+
+        val best = candidates.maxByOrNull { contactNameSimilarity(spoken, it.displayName.lowercase()) }
+        val bestScore = best?.let { contactNameSimilarity(spoken, it.displayName.lowercase()) } ?: 0.0
+
+        // Below this, the "closest" match is more likely a wrong contact than the
+        // one the user meant, so treat it as no match rather than guess wildly.
+        if (best == null || bestScore < 0.5) {
+            Log.w(TAG, "❌ No close-enough contact found for: $name (best score ${"%.2f".format(bestScore)})")
+            return null
+        }
+
+        Log.d(TAG, "✅ Closest contact match: ${best.displayName} -> ${best.number} (score ${"%.2f".format(bestScore)})")
+        return best.number
+    }
+
+    /**
+     * Similarity score in [0,1] between a spoken name and a contact's display name.
+     * A substring hit (either direction, e.g. "ayush" inside "ayushi sharma") scores
+     * highly and cheaply; otherwise falls back to normalized Levenshtein distance
+     * against the closest individual name part (so "Ayushi Sharma" is still found
+     * from just "Ayushi" or "Sharma", and small mis-transcriptions still match).
+     */
+    private fun contactNameSimilarity(spoken: String, contactName: String): Double {
+        if (contactName.contains(spoken) || spoken.contains(contactName)) {
+            // Favor closer length matches so "Ayushi" beats an unrelated contact
+            // that merely happens to contain "ayush" as a substring of a longer name.
+            val lengthRatio = minOf(spoken.length, contactName.length).toDouble() /
+                maxOf(spoken.length, contactName.length).toDouble()
+            return 0.85 + 0.15 * lengthRatio
+        }
+
+        val parts = contactName.split(" ", "\t").filter { it.isNotBlank() } + listOf(contactName)
+        val bestPartScore = parts.maxOf { part ->
+            val distance = levenshteinDistance(spoken, part)
+            val maxLen = maxOf(spoken.length, part.length)
+            if (maxLen == 0) 0.0 else 1.0 - (distance.toDouble() / maxLen.toDouble())
+        }
+        return bestPartScore
+    }
+
+    private fun levenshteinDistance(a: String, b: String): Int {
+        val dp = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in 0..a.length) dp[i][0] = i
+        for (j in 0..b.length) dp[0][j] = j
+        for (i in 1..a.length) {
+            for (j in 1..b.length) {
+                dp[i][j] = if (a[i - 1] == b[j - 1]) {
+                    dp[i - 1][j - 1]
+                } else {
+                    1 + minOf(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1])
+                }
+            }
+        }
+        return dp[a.length][b.length]
     }
 
     /**
@@ -6635,7 +6683,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     }
                     "Note created: $title"
                 }
-                
+
+                // No voice-driven delete by design — a spoken description
+                // can't reliably pick one note out of a list the way tapping
+                // it can. This exists so the model has an honest action to
+                // take instead of silently ignoring "delete my note" or
+                // claiming it did something it didn't.
+                "delete_note" ->
+                    "I can't delete notes by voice. Open Quick Notes and delete it there — " +
+                        "tap and hold a note, or open it and tap the delete icon."
+
                 "capture_photo_note" -> {
                     val title = args["title"] as? String ?: "Photo Note"
                     val content = args["content"] as? String ?: "Photo captured via voice command"

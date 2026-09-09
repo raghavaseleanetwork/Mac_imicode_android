@@ -115,8 +115,14 @@ class GeminiLiveService(
         // Pre-buffering: Wait for this many audio chunks before starting playback
         private const val PRE_BUFFER_COUNT = 3
         
-        // Audio timeout: How long to wait for more audio before declaring end of speech
-        private const val AUDIO_END_TIMEOUT_MS = 700L
+        // FALLBACK ONLY: how long a gap in arriving audio may last before the
+        // playback loop gives up on a turn that never sent an end-of-turn
+        // signal. Normal turns end on the server's own signal (see
+        // turnAudioComplete), so this no longer needs to be tight - and must
+        // not be: at the old 700ms an ordinary mid-sentence pause or network
+        // stall ended playback early and truncated the reply ("best
+        // restaurants in Jaipur" -> "best restaurants in").
+        private const val AUDIO_END_TIMEOUT_MS = 5000L
         // How long the first queued chunk of a turn may wait for the pre-buffer to
         // fill before we play it anyway. Gemini streams chunks milliseconds apart, so
         // a real multi-chunk reply always fills well inside this; only a reply that is
@@ -392,6 +398,21 @@ class GeminiLiveService(
     private val audioQueue = mutableListOf<ByteArray>()
     private val audioQueueLock = Any()
     private var isPreBuffering = true // Wait for buffer to fill before playing
+
+    /**
+     * True once the server has said this turn's audio is complete
+     * (turnComplete / generationComplete / interrupted).
+     *
+     * The playback loop used to decide the reply had finished purely from a
+     * short gap in arriving audio, which truncated replies whenever the model
+     * paused mid-sentence or the network stalled briefly - "best restaurants
+     * in Jaipur" came out as "best restaurants in". The server tells us
+     * authoritatively when a turn is over, so that is what ends playback now;
+     * the silence timeout is only a fallback for a turn whose end signal never
+     * arrives at all.
+     */
+    @Volatile
+    private var turnAudioComplete = false
     
     // 🆕 Mute functionality for vision chat integration
     private val isMuted = AtomicBoolean(false) // When true, blocks audio output (but keeps listening)
@@ -546,6 +567,18 @@ class GeminiLiveService(
                             }
                         }
                         Log.d(TAG, "🔊 PROCESSING CHIME STOPPED (max duration reached, no reply)")
+
+                        // 🆕 The server never sent turnComplete for this turn (dropped
+                        // response, stuck tool call, etc.), so recoverFromSilentTurn()
+                        // in handleGeminiMessage() never ran - that path only fires on
+                        // turnComplete. Without this, the session just goes silent
+                        // forever: no retry, no error, no listening. Nudge the model
+                        // for an answer now using whatever was transcribed so far, same
+                        // as the turnComplete-triggered recovery.
+                        val fullInput = currentInputTranscription.toString()
+                        if (!receivedAudioInCurrentTurn && !hasTranscriptionForCurrentTurn) {
+                            recoverFromSilentTurn(fullInput)
+                        }
                     }
                 }, thinkingCueToken, MAX_CUE_MS)
             } catch (e: Exception) {
@@ -1940,6 +1973,21 @@ class GeminiLiveService(
             ),
             mapOf(
                 "type" to "function",
+                "name" to "delete_note",
+                "description" to
+                    "Call this when the user asks to delete, remove, or get rid of a note " +
+                    "or reminder by voice. There is no voice-driven delete - it deliberately " +
+                    "cannot be done this way, since a spoken description can't reliably pick " +
+                    "out one specific note among many. This tool does not delete anything; it " +
+                    "exists so you tell the user clearly that they need to delete it themselves " +
+                    "in Quick Notes, rather than claiming it's done or staying silent.",
+                "parameters" to mapOf(
+                    "type" to "object",
+                    "properties" to emptyMap<String, Any>()
+                )
+            ),
+            mapOf(
+                "type" to "function",
                 "name" to "capture_photo_note",
                 "description" to "Take a photo with the glasses camera and attach it to a new note. Use when user says 'take a pic and add to notes', 'click photo and save in notes', 'capture this and note it down', or similar requests to photograph something and save it as a note.",
                 "parameters" to mapOf(
@@ -2135,6 +2183,7 @@ CRITICAL: Reply FAST and CONCISELY. No filler words. Match the user's vibe.
 
 QUICK NOTES: When the user asks to "remember this", "add to notes", "note this down", or mentions saving information, use the create_note tool to save it.
 When the user asks to "take a pic and add to notes", "click photo and save in notes", "capture this and note it", or wants to photograph something AND save it as a note, use the capture_photo_note tool.
+When the user asks to delete, remove, or get rid of a note (e.g. "delete that note", "remove my note about X"), call the delete_note tool. Do not claim you deleted it and do not say nothing - delete_note tells you the correct thing to say.
 
 MEETING MINUTES: When the user asks to "start meeting minutes", "record this meeting", "start recording the meeting", or similar, use the start_meeting tool to begin recording. If they mention a specific meeting name (e.g., "start meeting minutes for Raghav Meeting"), extract the meeting name and pass it in the 'title' parameter. Otherwise leave title empty for auto-generation.
 
@@ -2146,8 +2195,17 @@ SONG IDENTIFICATION: When the user asks what song or music is playing (in any la
 
 EMAIL - READING: When the user asks about new emails, their inbox, or unread mail, call read_emails and tell them the result briefly.
 
-WEB BROWSER - YOU CAN USE WEBSITES: You control a real browser on the user's phone, already signed in to sites they use. When the user wants something DONE on a website rather than just answered from memory - "open my email and check", "search Amazon for headphones and tell me the price", "book a table on this site", "check the score on the cricket site" - call browse_web and put their whole request in the 'goal' parameter. To read back whatever page is open, call read_current_page. For "how far is my Claude project", "what was I doing in ChatGPT", call catch_up_on_ai.
-If a browser tool comes back saying you need the user to sign in, solve a security check, or finish something on the phone, tell them EXACTLY that in one short line and stop - do not try another way around it and never ask them for a password or a one-time code. When they say they are done ("done", "logged in", "carry on", "ho gaya"), call browser_continue.
+WEB BROWSER - YOU CAN USE WEBSITES: You control a real browser on the user's phone, already signed in to sites they use. Call browse_web and put their whole request in the 'goal' parameter. To read back whatever page is open, call read_current_page. For "how far is my Claude project", "what was I doing in ChatGPT", call catch_up_on_ai.
+Call browse_web whenever the answer depends on information that is CURRENT or specific to a live site - flights, prices, availability, timings, scores, news, stock of an item, opening hours, "what's on X right now". Examples that MUST use browse_web: "find me flights to Delhi", "how much is this on Amazon", "is this in stock", "what's the score", "when does it open", "check the news on this". You do not know these from memory and your memory is out of date.
+NEVER answer this kind of question by naming a website and telling the user to go look themselves. Saying "you can check the IndiGo website" or "have a look at their site for details" is WRONG - you have a browser, so open it and get the actual answer. Call the tool FIRST, then report what you actually found.
+Once a page from browse_web/browser_continue is open, the whole browser stays voice-controlled turn by turn - do NOT call browse_web again for a simple next step on the SAME page. Use the direct tools instead, which act immediately:
+- "scroll down"/"scroll up"/"page down"/"scroll to the top" -> browser_scroll (direction, amount: "a bit"/"a lot"/"top"/"bottom")
+- "click sign up"/"tap the second result"/"open that link" -> browser_click (description of what to tap, in the user's words)
+- "type headphones in the search box"/"put my name in the name field" -> browser_type (which field, the text, and whether to submit/press enter)
+- "go back"/"previous page" -> browser_back ; "go forward" -> browser_forward
+- "never mind"/"cancel that"/"forget it" about something the browser is doing or waiting on -> browser_cancel
+Only fall back to a fresh browse_web call for a new, multi-step goal that isn't just one direct action on the current page.
+If a browser tool comes back saying you need the user to sign in, solve a security check, or finish something on the phone, tell them EXACTLY that in one short line and stop - do not try another way around it and never ask them for a password or a one-time code. When they say they are done ("done", "logged in", "carry on", "ho gaya"), call browser_continue. If they instead say to drop it, call browser_cancel.
 Browser tools take a few seconds. Say one short line like "Let me check" BEFORE calling, then report what came back.
 
 EMAIL - SENDING (always confirm first): When the user asks you to email or write to someone, call draft_email with your best guess at recipient, subject, and body from what they said. Then READ THE DRAFT BACK to the user out loud in your own next spoken turn (recipient, subject, and a short summary of the body) and ask "should I send it?". Do NOT call confirm_send_email in the same turn as draft_email. Only call confirm_send_email in a LATER turn, after the user has explicitly agreed (e.g. "yes", "send it", "go ahead"). If the user wants changes, call draft_email again with the corrected details and read it back again. If the user declines, do not send anything.
@@ -2511,8 +2569,14 @@ $visionInstruction"""
                     } else if (!isPreBuffering) {
                         // Queue is empty but we were playing - check if more audio is coming
                         val timeSinceLastAudio = System.currentTimeMillis() - lastAudioTime
-                        
-                        if (timeSinceLastAudio > AUDIO_END_TIMEOUT_MS) {
+
+                        // End the turn when the SERVER says it's over. A gap in
+                        // arriving audio is not the same thing: the model pauses
+                        // mid-sentence and the network stalls, and treating either
+                        // as "finished" truncated replies ("best restaurants in
+                        // Jaipur" -> "best restaurants in"). The timeout below is
+                        // only a fallback for a turn whose end signal never lands.
+                        if (turnAudioComplete || timeSinceLastAudio > AUDIO_END_TIMEOUT_MS) {
                             // No new audio for a while, AI likely finished speaking.
                             //
                             // IMPORTANT: "no more writes" is NOT "finished playing".
@@ -2522,12 +2586,15 @@ $visionInstruction"""
                             // suspend A2DP and cut the tail off — "goodbye" came out
                             // as "good". Wait for the hardware playback head to reach
                             // everything we wrote before touching the route.
+                            val endedBy = if (turnAudioComplete) "server end-of-turn"
+                                else "fallback timeout ${AUDIO_END_TIMEOUT_MS}ms"
                             waitForTrackToDrain()
                             reacquireScoForListening()
                             isAIPlaying.set(false) // Resume mic capture
                             isPreBuffering = true // Reset for next turn
+                            turnAudioComplete = false // Reset for next turn
                             callbacks.onAudioPlaybackEnd()
-                            Log.d(TAG, "🔇 Audio playback ended (no new audio for ${AUDIO_END_TIMEOUT_MS}ms)")
+                            Log.d(TAG, "🔇 Audio playback ended ($endedBy)")
                         }
                         delay(5) // Quick check for new audio
                     } else {
@@ -2835,6 +2902,17 @@ $visionInstruction"""
             if (serverContent != null) {
                 val turnComplete = serverContent["turnComplete"] as? Boolean ?: false
                 val interrupted = serverContent["interrupted"] as? Boolean ?: false
+                // Gemini sends generationComplete when it has finished producing
+                // this turn's audio, usually a moment before turnComplete.
+                val generationComplete = serverContent["generationComplete"] as? Boolean ?: false
+
+                // Tell the playback loop the turn's audio is genuinely finished,
+                // so it stops guessing from gaps between chunks and truncating
+                // replies mid-sentence. It still drains whatever is already
+                // queued before ending — this only says "no more is coming".
+                if (turnComplete || generationComplete || interrupted) {
+                    turnAudioComplete = true
+                }
 
                 // User-speech transcript (requested via input_audio_transcription).
                 val inputTranscription = serverContent["inputTranscription"] as? Map<*, *>
@@ -2882,6 +2960,9 @@ $visionInstruction"""
                                     Log.d(TAG, "🤖 GEMINI RESPONSE AUDIO RECEIVED")
                                     stopThinkingSound()
                                 }
+                                // More audio for this turn means it is not over,
+                                // whatever a previous turn's end signal left behind.
+                                turnAudioComplete = false
                                 val audioData = Base64.decode(audioBase64, Base64.DEFAULT)
                                 synchronized(audioQueueLock) {
                                     audioQueue.add(audioData)
@@ -3306,6 +3387,7 @@ $visionInstruction"""
      */
     fun interruptCurrentResponse() {
         Log.d(TAG, "🛑 interruptCurrentResponse called - clearing audio queue and stopping AI playback")
+        turnAudioComplete = false // Don't carry this turn's end state into the next
         synchronized(audioQueueLock) {
             audioQueue.clear()
         }

@@ -66,6 +66,17 @@ object GlassBrowserEngine {
         val view = WebView(context.applicationContext)
         WebSessionManager.configure(view, desktopMode = true)
         view.webViewClient = WebViewClient()
+        // Same OAuth-popup fix as WebBrowserActivity (see PopupWindowRouter):
+        // without this, "Continue with Google" during a voice-driven sign-in
+        // would leave this WebView waiting on a popup that never opens.
+        view.webChromeClient = object : android.webkit.WebChromeClient() {
+            override fun onCreateWindow(
+                webView: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean = PopupWindowRouter.routeInto(view, resultMsg)
+        }
         // Never attached to a window: this browser has no viewer. Give it a
         // real size anyway, or layout-dependent scripts and visibility checks
         // see a 0x0 page and report nothing.

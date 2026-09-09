@@ -7,6 +7,7 @@
     android:background="@drawable/bg_comper_mark1_screen">
 
     <LinearLayout
+        android:id="@+id/layoutChatContent"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
@@ -140,6 +141,7 @@
 
         <!-- ============ COMPOSER + LISTENING (swap in same slot) ============ -->
         <FrameLayout
+            android:id="@+id/layoutComposerSlot"
             android:layout_width="match_parent"
             android:layout_height="60dp"
             android:layout_marginTop="8dp">

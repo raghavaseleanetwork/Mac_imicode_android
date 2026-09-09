@@ -31,8 +31,10 @@ class ConversationHistoryActivity : AppCompatActivity() {
     private lateinit var rvThread: RecyclerView
     private lateinit var recentsAdapter: HistoryRecentsAdapter
     private lateinit var bubbleAdapter: HistoryBubbleAdapter
+    private lateinit var btnClearHistory: TextView
 
     private var showingThread = false
+    private var openTopic: HistoryTopic? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,8 +55,9 @@ class ConversationHistoryActivity : AppCompatActivity() {
         rvThread.layoutManager = LinearLayoutManager(this)
         rvThread.adapter = bubbleAdapter
 
+        btnClearHistory = findViewById(R.id.btnClearHistory)
         findViewById<ImageView>(R.id.btnBack).setOnClickListener { handleBack() }
-        findViewById<TextView>(R.id.btnClearHistory).setOnClickListener { clearHistory() }
+        btnClearHistory.setOnClickListener { onClearOrDeleteClicked() }
 
         loadAndRenderHistory()
     }
@@ -66,16 +69,20 @@ class ConversationHistoryActivity : AppCompatActivity() {
     }
 
     private fun openThread(topic: HistoryTopic) {
+        openTopic = topic
         bubbleAdapter.update(topic.messages)
         showingThread = true
         viewRecents.visibility = View.GONE
         viewThread.visibility = View.VISIBLE
+        btnClearHistory.text = "Delete"
     }
 
     private fun showRecents() {
+        openTopic = null
         showingThread = false
         viewThread.visibility = View.GONE
         viewRecents.visibility = View.VISIBLE
+        btnClearHistory.text = "Clear"
         loadAndRenderHistory()
     }
 
@@ -96,6 +103,7 @@ class ConversationHistoryActivity : AppCompatActivity() {
             .filter { it.messages.isNotEmpty() }
             .map { session ->
                 HistoryTopic(
+                    sessionId = session.id,
                     title = session.displayTitle(),
                     messages = session.messages.map { msg ->
                         // true = user bubble (right/orange), false = AI bubble (left/dark)
@@ -109,7 +117,16 @@ class ConversationHistoryActivity : AppCompatActivity() {
         rvRecents.visibility = if (topics.isEmpty()) View.GONE else View.VISIBLE
     }
 
-    private fun clearHistory() {
+    /**
+     * "Clear" (Recents screen) wipes every conversation. "Delete" (an open single
+     * thread) only removes that one session - the button's label and behavior
+     * switch depending on which screen is showing (see [openThread]/[showRecents]).
+     */
+    private fun onClearOrDeleteClicked() {
+        if (showingThread) deleteOpenThread() else clearAllHistory()
+    }
+
+    private fun clearAllHistory() {
         ConversationSessionStore.clearAll(this)
         recentsAdapter.update(emptyList())
         bubbleAdapter.update(emptyList())
@@ -117,5 +134,12 @@ class ConversationHistoryActivity : AppCompatActivity() {
         tvEmptyRecents.visibility = View.VISIBLE
         rvRecents.visibility = View.GONE
         Toast.makeText(this, "Conversation history cleared", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun deleteOpenThread() {
+        val topic = openTopic ?: return
+        ConversationSessionStore.deleteSession(this, topic.sessionId)
+        Toast.makeText(this, "Conversation deleted", Toast.LENGTH_SHORT).show()
+        showRecents()
     }
 }

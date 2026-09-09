@@ -23,8 +23,14 @@ object GlassBrowserTools {
     val TOOL_NAMES = setOf(
         "browse_web",
         "browser_continue",
+        "browser_cancel",
         "read_current_page",
-        "catch_up_on_ai"
+        "catch_up_on_ai",
+        "browser_scroll",
+        "browser_click",
+        "browser_type",
+        "browser_back",
+        "browser_forward"
     )
 
     /**
@@ -37,13 +43,16 @@ object GlassBrowserTools {
             "type" to "function",
             "name" to "browse_web",
             "description" to
-                "Control a real web browser to carry out a task on a website. Use this " +
-                "when the user wants something DONE on a site rather than just answered: " +
-                "'open my email and check', 'find flights to Delhi on this site', " +
-                "'search Amazon for headphones and tell me the price', 'go to the " +
-                "cricket site and tell me the score'. The browser stays signed in to " +
-                "sites the user has logged into before. Describe the whole task in the " +
-                "'goal' parameter, in the user's own words.",
+                "Control a real web browser to look something up on the live web or " +
+                "carry out a task on a website. Use this whenever the answer depends on " +
+                "CURRENT information you cannot know from memory - flights, prices, " +
+                "availability, timings, scores, news, stock, opening hours - as well as " +
+                "for doing things on a site: 'find me flights to Delhi', 'how much is " +
+                "this on Amazon', 'what's the score', 'open my email and check', " +
+                "'book a table on this site'. Never answer these by telling the user to " +
+                "go check a website themselves; open it here and report what you found. " +
+                "The browser stays signed in to sites the user has logged into before. " +
+                "Describe the whole task in the 'goal' parameter, in the user's own words.",
             "parameters" to mapOf(
                 "type" to "object",
                 "properties" to mapOf(
@@ -63,6 +72,111 @@ object GlassBrowserTools {
                 "something themselves, like signing in or solving a security check. " +
                 "Call this when the user says they are done — 'I've logged in', " +
                 "'done', 'carry on', 'continue', 'ho gaya'.",
+            "parameters" to mapOf(
+                "type" to "object",
+                "properties" to emptyMap<String, Any>()
+            )
+        ),
+        mapOf(
+            "type" to "function",
+            "name" to "browser_cancel",
+            "description" to
+                "Give up on the current browsing task instead of continuing it. Use " +
+                "when the user says 'never mind', 'cancel that', 'forget it', 'stop', " +
+                "or 'give up' about something the browser was doing or waiting on.",
+            "parameters" to mapOf(
+                "type" to "object",
+                "properties" to emptyMap<String, Any>()
+            )
+        ),
+        mapOf(
+            "type" to "function",
+            "name" to "browser_scroll",
+            "description" to
+                "Scroll the page currently open in the browser, without re-planning " +
+                "the whole task. Use for 'scroll down', 'scroll up', 'go down more', " +
+                "'page down', 'scroll to the top'.",
+            "parameters" to mapOf(
+                "type" to "object",
+                "properties" to mapOf(
+                    "direction" to mapOf(
+                        "type" to "string",
+                        "description" to "'down' or 'up'. Defaults to down."
+                    ),
+                    "amount" to mapOf(
+                        "type" to "string",
+                        "description" to
+                            "How far: 'a bit', 'a lot'/'page', or 'top'/'bottom' to jump " +
+                            "to the very start or end of the page. Defaults to 'a bit'."
+                    )
+                )
+            )
+        ),
+        mapOf(
+            "type" to "function",
+            "name" to "browser_click",
+            "description" to
+                "Tap a button or link on the page currently open in the browser, by " +
+                "what it says, without re-planning the whole task. Use for 'click " +
+                "sign up', 'tap the second result', 'open the first link', 'press " +
+                "search'. Won't tap a sign-in/login control — that still needs the " +
+                "user's own tap.",
+            "parameters" to mapOf(
+                "type" to "object",
+                "properties" to mapOf(
+                    "description" to mapOf(
+                        "type" to "string",
+                        "description" to "What the button or link says or looks like, in the user's words"
+                    )
+                ),
+                "required" to listOf("description")
+            )
+        ),
+        mapOf(
+            "type" to "function",
+            "name" to "browser_type",
+            "description" to
+                "Type text into a field on the page currently open in the browser, by " +
+                "what the field is for, without re-planning the whole task. Use for " +
+                "'type headphones in the search box', 'put my name in the name field'. " +
+                "Never used for passwords, OTPs or card numbers — those are always the " +
+                "user's own step.",
+            "parameters" to mapOf(
+                "type" to "object",
+                "properties" to mapOf(
+                    "field" to mapOf(
+                        "type" to "string",
+                        "description" to "Which field, by its label or placeholder, in the user's words"
+                    ),
+                    "text" to mapOf(
+                        "type" to "string",
+                        "description" to "The text to type"
+                    ),
+                    "submit" to mapOf(
+                        "type" to "boolean",
+                        "description" to "True if this should also submit the field (press Enter)"
+                    )
+                ),
+                "required" to listOf("field", "text")
+            )
+        ),
+        mapOf(
+            "type" to "function",
+            "name" to "browser_back",
+            "description" to
+                "Go back to the previous page in the browser. Use for 'go back', " +
+                "'previous page'.",
+            "parameters" to mapOf(
+                "type" to "object",
+                "properties" to emptyMap<String, Any>()
+            )
+        ),
+        mapOf(
+            "type" to "function",
+            "name" to "browser_forward",
+            "description" to
+                "Go forward to the next page in the browser, after having gone back. " +
+                "Use for 'go forward'.",
             "parameters" to mapOf(
                 "type" to "object",
                 "properties" to emptyMap<String, Any>()
@@ -150,12 +264,25 @@ object GlassBrowserTools {
             when (toolName) {
                 "browse_web" -> browse(context, args["goal"]?.toString().orEmpty())
                 "browser_continue" -> resume(context)
+                "browser_cancel" -> cancel()
                 "read_current_page" -> readPage(context, args["question"]?.toString())
                 "catch_up_on_ai" -> catchUp(
                     context,
                     args["service"]?.toString().orEmpty(),
                     args["question"]?.toString()
                 )
+                "browser_scroll" -> scroll(
+                    args["direction"]?.toString(),
+                    args["amount"]?.toString()
+                )
+                "browser_click" -> click(args["description"]?.toString().orEmpty())
+                "browser_type" -> type(
+                    args["field"]?.toString().orEmpty(),
+                    args["text"]?.toString().orEmpty(),
+                    args["submit"]?.toString()?.toBooleanStrictOrNull() ?: false
+                )
+                "browser_back" -> backOrForward(forward = false)
+                "browser_forward" -> backOrForward(forward = true)
                 else -> "I don't know how to do that in the browser."
             }
         } catch (e: Exception) {
@@ -202,6 +329,156 @@ object GlassBrowserTools {
             GlassBrowserEngine.markBusy(false)
         }
     }
+
+    private fun cancel(): String {
+        if (!GlassBrowserEngine.awaitingUser && !GlassBrowserEngine.isBusy) {
+            return "There's nothing to cancel."
+        }
+        GlassBrowserEngine.cancel()
+        return "Okay, I've dropped that."
+    }
+
+    /**
+     * A quick, direct action against whatever page is already open — no LLM
+     * planning turn, no page snapshot round-trip through a planner prompt.
+     * These exist so ordinary mid-browsing commands ("scroll down", "click
+     * sign up") answer immediately instead of re-running the whole [browse]
+     * goal loop, which was the only way to act on the page before.
+     */
+    private suspend fun scroll(direction: String?, amount: String?): String {
+        if (GlassBrowserEngine.isBusy) return "Hang on, I'm still doing the last thing."
+        if (GlassBrowserEngine.currentUrl() == null) return "There's no page open yet."
+
+        val amountText = amount?.lowercase().orEmpty()
+        val dir = if (direction?.lowercase()?.contains("up") == true) -1.0 else 1.0
+        val magnitude = when {
+            // No absolute "jump to edge" primitive exists in BrowserAction (by
+            // design, the executor only performs the closed action set below),
+            // so "top"/"bottom" is approximated with a large relative scroll —
+            // comfortably more than any single page's height.
+            "top" in amountText -> return runDirectAction(BrowserAction.Scroll(-25.0))
+            "bottom" in amountText -> return runDirectAction(BrowserAction.Scroll(25.0))
+            "lot" in amountText || "page" in amountText -> 1.6
+            "bit" in amountText || "little" in amountText -> 0.4
+            else -> 0.9
+        }
+
+        val action = BrowserAction.Scroll(dir * magnitude)
+        return runDirectAction(action)
+    }
+
+    private suspend fun click(description: String): String {
+        if (description.isBlank()) return "What should I click?"
+        if (GlassBrowserEngine.isBusy) return "Hang on, I'm still doing the last thing."
+        if (GlassBrowserEngine.currentUrl() == null) return "There's no page open yet."
+
+        val page = GlassBrowserEngine.readPage()
+        val target = findByLabel(page, description, includeInputs = false)
+            ?: return "I can't find \"$description\" on this page."
+
+        val action = BrowserAction.Click(target.selector, target.label)
+        return runDirectAction(action, page)
+    }
+
+    private suspend fun type(field: String, text: String, submit: Boolean): String {
+        if (field.isBlank() || text.isBlank()) return "What should I type, and into which field?"
+        if (GlassBrowserEngine.isBusy) return "Hang on, I'm still doing the last thing."
+        if (GlassBrowserEngine.currentUrl() == null) return "There's no page open yet."
+
+        val page = GlassBrowserEngine.readPage()
+        val target = findByLabel(page, field, includeInputs = true)
+            ?: return "I can't find a \"$field\" field on this page."
+
+        val action = BrowserAction.Type(target.selector, text, submit)
+        return runDirectAction(action, page)
+    }
+
+    private suspend fun backOrForward(forward: Boolean): String {
+        if (GlassBrowserEngine.isBusy) return "Hang on, I'm still doing the last thing."
+        val action = if (forward) BrowserAction.Forward else BrowserAction.Back
+        return runDirectAction(action)
+    }
+
+    /** One labelled, clickable/typable element found on the page. */
+    private data class LabelledTarget(val selector: String, val label: String)
+
+    /**
+     * Best-effort match of a spoken description against the page's buttons,
+     * links, and (optionally) input labels — same data [WebAgentPlanner] would
+     * reason over, but matched directly instead of via an LLM call, so this
+     * stays fast. Exact label match wins; otherwise the element whose label
+     * contains the most words from the description wins.
+     */
+    private fun findByLabel(
+        page: PageReader.PageSnapshot,
+        description: String,
+        includeInputs: Boolean
+    ): LabelledTarget? {
+        val query = description.lowercase().trim()
+        val candidates = mutableListOf<LabelledTarget>()
+
+        fun collect(key: String) {
+            val arr = page.raw.optJSONArray(key) ?: return
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val label = o.optString("label")
+                if (label.isBlank()) continue
+                if (includeInputs && key == "inputs" && o.optBoolean(PageReader.SENSITIVE_FLAG)) continue
+                candidates.add(LabelledTarget(o.optString("selector"), label))
+            }
+        }
+        collect("buttons")
+        collect("links")
+        if (includeInputs) collect("inputs")
+
+        if (candidates.isEmpty()) return null
+
+        candidates.firstOrNull { it.label.equals(query, ignoreCase = true) }?.let { return it }
+        candidates.firstOrNull { it.label.lowercase().contains(query) }?.let { return it }
+        candidates.firstOrNull { query.contains(it.label.lowercase()) }?.let { return it }
+
+        val queryWords = query.split(" ").filter { it.length > 2 }
+        if (queryWords.isEmpty()) return null
+        return candidates
+            .map { it to queryWords.count { w -> it.label.lowercase().contains(w) } }
+            .filter { it.second > 0 }
+            .maxByOrNull { it.second }
+            ?.first
+    }
+
+    /** Validates then executes one action directly, outside the planner loop. */
+    private suspend fun runDirectAction(
+        action: BrowserAction,
+        page: PageReader.PageSnapshot? = null
+    ): String {
+        val snapshot = page ?: GlassBrowserEngine.readPage()
+        when (val verdict = ActionValidator.validate(action, snapshot)) {
+            is ActionValidator.Verdict.Handoff -> {
+                GlassBrowserEngine.requireUser(verdict.reason, null)
+                return "${verdict.reason} Say continue when you're done."
+            }
+            is ActionValidator.Verdict.NeedsConfirmation -> {
+                // A spoken "yes" is too weak a gate for anything the planner
+                // itself refuses to do without an on-screen tap — send the
+                // user to the Web screen the same way the full agent loop does.
+                return "${verdict.prompt} Please do that step on the Web screen."
+            }
+            is ActionValidator.Verdict.Reject -> return "I couldn't do that: ${verdict.reason}"
+            ActionValidator.Verdict.Allow -> Unit
+        }
+
+        GlassBrowserEngine.markBusy(true)
+        return try {
+            val executor = GlassBrowserEngine.executor()
+            val result = withContextMain { executor.execute(action) }
+            result.detail
+        } finally {
+            GlassBrowserEngine.markBusy(false)
+        }
+    }
+
+    private suspend fun <T> withContextMain(block: suspend () -> T): T =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { block() }
 
     private suspend fun readPage(context: Context, question: String?): String {
         val url = GlassBrowserEngine.currentUrl()

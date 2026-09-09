@@ -42,9 +42,11 @@ class HistoryRecentsAdapter(
 
 /**
  * A recent conversation topic: a title plus the bubble messages that belong to it.
- * [messages] is a list of (isUser, text).
+ * [messages] is a list of (isUser, text). [sessionId] identifies the underlying
+ * [ConversationSession] so a single thread can be deleted without affecting others.
  */
 data class HistoryTopic(
+    val sessionId: String,
     val title: String,
     val messages: List<Pair<Boolean, String>>
 )

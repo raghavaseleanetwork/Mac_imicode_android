@@ -35,7 +35,16 @@ object WebSessionManager {
             displayZoomControls = false
 
             javaScriptCanOpenWindowsAutomatically = true
-            setSupportMultipleWindows(false)
+            // Google Sign-In ("Continue with Google") and similar OAuth flows
+            // open in a popup window (window.open), not a normal navigation.
+            // With this false and no WebChromeClient.onCreateWindow handler,
+            // that popup request is silently dropped - the page just sits
+            // there forever, looking frozen, because it's still waiting for a
+            // popup that never opens. True here + onCreateWindow in
+            // WebBrowserActivity/GlassBrowserEngine routes the popup's
+            // navigation back into the same WebView instead of actually
+            // spawning a second window.
+            setSupportMultipleWindows(true)
 
             mediaPlaybackRequiresUserGesture = true
             cacheMode = WebSettings.LOAD_DEFAULT

@@ -192,6 +192,23 @@ class HotHelper private constructor(private val context: Context) {
     }
 
     /**
+     * Arm the detector on the GLASSES mic.
+     *
+     * [useGlassBLEAudio] is sticky process-wide state, and a bare [start] just
+     * inherits whatever the last caller happened to leave it as. Mark 1 sets it
+     * false during pre-warm (so the pre-warm pass doesn't try to bring SCO up
+     * before the glasses are connected), which meant every later start — the
+     * background service's included — silently ran on the phone mic instead.
+     *
+     * Callers that want the glasses mic should use this rather than setting the
+     * flag and calling start() separately, so the two can't drift apart again.
+     */
+    fun armOnGlassMic() {
+        setPreferGlassBleAudio(true)
+        start()
+    }
+
+    /**
      * Set detection threshold (0.0 to 1.0)
      * Lower = more sensitive but more false positives
      * Higher = less sensitive but fewer false positives

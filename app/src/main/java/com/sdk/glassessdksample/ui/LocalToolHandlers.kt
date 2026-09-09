@@ -8,6 +8,7 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 /**
  * Small collection of local web tool helpers used by GeminiLiveService for quick lookups.
@@ -17,7 +18,18 @@ import java.net.URLEncoder
  */
 object LocalToolHandlers {
     private const val TAG = "LocalToolHandlers"
-    private val client = OkHttpClient()
+
+    // 🆕 Explicit short timeouts. These calls run inside a `runBlocking` on the
+    // Gemini Live tool-call callback (see MainActivity.handleGeminiToolCall), so a
+    // hung/slow network call previously blocked that thread forever - Gemini Live
+    // never got a tool response and the user heard only the loading tone with no
+    // answer. A bounded timeout guarantees the tool call always returns in time.
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS)
+        .writeTimeout(6, TimeUnit.SECONDS)
+        .callTimeout(8, TimeUnit.SECONDS)
+        .build()
 
     suspend fun dictionaryLookup(word: String): String = withContext(Dispatchers.IO) {
         try {

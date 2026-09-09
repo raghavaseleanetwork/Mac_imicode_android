@@ -1,5 +1,6 @@
 package com.sdk.glassessdksample.ui
 
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -40,6 +41,27 @@ class QuickNotesActivity : AppCompatActivity() {
     private var showingAi = false
     private var searchQuery = ""
 
+    // System speech-to-text dialog for the search mic button.
+    private val speechLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode != RESULT_OK) return@registerForActivityResult
+        val spoken = result.data
+            ?.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS)
+            ?.firstOrNull()
+            .orEmpty()
+        if (spoken.isNotBlank()) {
+            etSearch.setText(spoken)
+            etSearch.setSelection(etSearch.text.length)
+        }
+    }
+
+    private val recordAudioPermissionLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) startVoiceSearch()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_quick_notes)
@@ -64,7 +86,8 @@ class QuickNotesActivity : AppCompatActivity() {
             items = emptyList(),
             onClick = { note -> openEditor(note) },
             onEdit = { note -> openEditor(note) },
-            onCopy = { note -> copyNote(note) }
+            onCopy = { note -> copyNote(note) },
+            onDelete = { note -> confirmDeleteNote(note) }
         )
         rvNotes.apply {
             layoutManager = LinearLayoutManager(this@QuickNotesActivity)
@@ -75,6 +98,8 @@ class QuickNotesActivity : AppCompatActivity() {
         tabSelf.setOnClickListener { selectTab(ai = false) }
 
         findViewById<ImageView>(R.id.btn_compose).setOnClickListener { openEditor(null) }
+
+        findViewById<ImageView>(R.id.btn_search_mic).setOnClickListener { onSearchMicClicked() }
 
         etSearch.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -156,6 +181,34 @@ class QuickNotesActivity : AppCompatActivity() {
         return items
     }
 
+    private fun onSearchMicClicked() {
+        val hasPermission = androidx.core.content.ContextCompat.checkSelfPermission(
+            this, android.Manifest.permission.RECORD_AUDIO
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (hasPermission) {
+            startVoiceSearch()
+        } else {
+            recordAudioPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    private fun startVoiceSearch() {
+        val intent = Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(
+                android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+            )
+            putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, java.util.Locale.getDefault().toString())
+            putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT, "Search notes")
+            putExtra(android.speech.RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+        }
+        try {
+            speechLauncher.launch(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Voice search not available on this device", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     private fun openEditor(note: QuickNote?) {
         val intent = Intent(this, NoteEditorActivity::class.java)
         if (note != null) {
@@ -171,6 +224,20 @@ class QuickNotesActivity : AppCompatActivity() {
         val text = if (note.title.isBlank()) note.content else "${note.title}\n\n${note.content}"
         clipboard.setPrimaryClip(ClipData.newPlainText(note.title, text))
         Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Long-press on a note in the list -> delete, with a confirmation. */
+    private fun confirmDeleteNote(note: QuickNote) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete this note?")
+            .setMessage(note.title.ifBlank { "This note" } + " will be permanently deleted.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete") { _, _ ->
+                notesManager.deleteNote(note.id)
+                Toast.makeText(this, "Note deleted", Toast.LENGTH_SHORT).show()
+                refreshList()
+            }
+            .show()
     }
 
     override fun onResume() {

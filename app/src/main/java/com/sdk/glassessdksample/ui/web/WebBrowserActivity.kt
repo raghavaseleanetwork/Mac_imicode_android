@@ -85,6 +85,7 @@ class WebBrowserActivity : AppCompatActivity() {
         setupControls()
         setupCommandBar()
         setupBackHandling()
+        setupCommandBarImeInset()
 
         speaker = AgentSpeaker(this).apply { enabled = speakRepliesEnabled() }
 
@@ -174,6 +175,19 @@ class WebBrowserActivity : AppCompatActivity() {
             override fun onReceivedTitle(view: WebView?, title: String?) {
                 if (!title.isNullOrBlank()) binding.tvPageTitle.text = title
             }
+
+            // "Continue with Google" and other OAuth buttons open in a popup
+            // (window.open), not a normal link. Without this, the popup
+            // request has nowhere to go and the page just sits there forever,
+            // looking frozen. There's only ever one visible WebView here, so
+            // route the popup's navigation into it instead of spawning a
+            // second window.
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean = PopupWindowRouter.routeInto(binding.webView, resultMsg)
         }
 
         binding.webView.setDownloadListener { url, _, _, _, _ ->
@@ -353,11 +367,81 @@ class WebBrowserActivity : AppCompatActivity() {
             }
         }
         binding.btnSendCommand.setOnClickListener { submitCommand() }
-        binding.btnAgentStop.setOnClickListener { agent?.stop() }
-        binding.btnAgentContinue.setOnClickListener { onContinueTapped() }
+        binding.btnAgentStop.setOnClickListener {
+            if (isShowingGlassHandoff) cancelGlassHandoff() else agent?.stop()
+        }
+        binding.btnAgentContinue.setOnClickListener {
+            if (isShowingGlassHandoff) continueGlassHandoff() else onContinueTapped()
+        }
         binding.btnMic.setOnClickListener { toggleVoiceInput() }
         binding.btnHistory.setOnClickListener { showCommandHistory() }
         binding.btnMic.alpha = 0.75f
+    }
+
+    /**
+     * Keeps the command bar (and what's typed into it) above the on-screen
+     * keyboard.
+     *
+     * [SystemBarsInsets.apply] turns on edge-to-edge drawing for the whole
+     * window, which is what made the keyboard start OVERLAPPING the command
+     * bar instead of pushing it up: edge-to-edge windows are responsible for
+     * consuming every inset themselves, including the IME, and the shared
+     * [SystemBarsInsets] listener on the root view only ever accounted for
+     * systemBars()/displayCutout() - never ime() - so `adjustResize` in the
+     * manifest had nothing left to do. Without this, the keyboard simply
+     * painted over the command bar, which is exactly why text typed into it
+     * (over on the right of the field, past where the keyboard started)
+     * couldn't be seen while typing.
+     *
+     * Must be called AFTER [SystemBarsInsets.apply] in onCreate - it
+     * deliberately replaces that class's listener on this screen's root; see
+     * the body for why.
+     */
+    private fun setupCommandBarImeInset() {
+        // This screen's root IS the vertical column (top bar, address bar, the
+        // weighted WebView, status strip, command bar, bottom controls), and
+        // SystemBarsInsets treats it as a "plain screen": on every insets
+        // dispatch it overwrites this view's padding on all four sides from
+        // its own snapshotted base values.
+        //
+        // That is why the earlier attempts here never worked. Growing the
+        // command bar's own margin does nothing useful (margin reserves blank
+        // space around one view; it does not move the bottom controls below
+        // it), and a listener registered on an ancestor runs BEFORE
+        // SystemBarsInsets' listener on this root, so whatever it set was
+        // immediately overwritten a moment later.
+        //
+        // Only one WindowInsets listener can exist per view, so this replaces
+        // SystemBarsInsets' listener on the root and does BOTH jobs in one
+        // place: the same system-bar/cutout padding it applied, plus the IME
+        // height added to the bottom. Bottom padding on this column shrinks
+        // the space its children share, and the WebView is the only weighted
+        // child, so it alone gives up the height - the command bar and bottom
+        // controls ride up together, flush above the keyboard.
+        val root = binding.root
+        val basePaddingLeft = root.paddingLeft
+        val basePaddingTop = root.paddingTop
+        val basePaddingRight = root.paddingRight
+        val basePaddingBottom = root.paddingBottom
+
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val bars = insets.getInsets(
+                androidx.core.view.WindowInsetsCompat.Type.systemBars() or
+                    androidx.core.view.WindowInsetsCompat.Type.displayCutout()
+            )
+            val imeBottom = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime()).bottom
+            // With the keyboard up the gesture/nav inset sits behind it, so the
+            // larger of the two is the real amount to clear - adding them would
+            // double count and leave a dead gap above the keyboard.
+            view.setPadding(
+                basePaddingLeft + bars.left,
+                basePaddingTop + bars.top,
+                basePaddingRight + bars.right,
+                basePaddingBottom + maxOf(bars.bottom, imeBottom)
+            )
+            androidx.core.view.WindowInsetsCompat.CONSUMED
+        }
+        androidx.core.view.ViewCompat.requestApplyInsets(root)
     }
 
     // ---------------------------------------------------------------- voice
@@ -410,37 +494,6 @@ class WebBrowserActivity : AppCompatActivity() {
         override fun onError(message: String) {
             Toast.makeText(this@WebBrowserActivity, message, Toast.LENGTH_SHORT).show()
         }
-
-        override fun onFallbackToSystemDialog(intent: android.content.Intent) {
-            try {
-                @Suppress("DEPRECATION")
-                startActivityForResult(intent, VoiceInputController.REQ_SYSTEM_SPEECH)
-            } catch (_: Exception) {
-                Toast.makeText(
-                    this@WebBrowserActivity,
-                    "Voice input isn't available on this device.",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        }
-    }
-
-    @Deprecated("Matches the app's existing speech-dialog pattern")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
-        @Suppress("DEPRECATION")
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != VoiceInputController.REQ_SYSTEM_SPEECH) return
-        if (resultCode != RESULT_OK) return
-
-        val text = data
-            ?.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS)
-            ?.firstOrNull()
-            .orEmpty()
-        if (text.isBlank()) return
-
-        binding.etCommand.setText(text)
-        binding.etCommand.setSelection(binding.etCommand.text.length)
-        if (awaitingAnswer || autoRunVoice()) submitCommand()
     }
 
     override fun onRequestPermissionsResult(
@@ -491,7 +544,22 @@ class WebBrowserActivity : AppCompatActivity() {
             binding.etCommand.requestFocus()
             val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             imm.showSoftInput(binding.etCommand, InputMethodManager.SHOW_IMPLICIT)
+            // Flipping visibility on an already-laid-out window doesn't by
+            // itself trigger a fresh WindowInsets dispatch, and this fires
+            // BEFORE the keyboard has actually finished animating in - so the
+            // IME height it would read is briefly still zero. Re-request
+            // insets now and again shortly after the keyboard's own show
+            // animation should have settled, so the column's IME padding
+            // (see setupCommandBarImeInset) actually gets applied against the
+            // real, current keyboard height instead of stale/zero.
+            binding.layoutCommandBar.requestApplyInsetsWhenReady()
         }
+    }
+
+    /** Requests a fresh insets pass now, and again once the IME has likely settled. */
+    private fun View.requestApplyInsetsWhenReady() {
+        androidx.core.view.ViewCompat.requestApplyInsets(this)
+        postDelayed({ androidx.core.view.ViewCompat.requestApplyInsets(this) }, IME_SETTLE_MS)
     }
 
     private fun submitCommand() {
@@ -694,6 +762,7 @@ class WebBrowserActivity : AppCompatActivity() {
             binding.etCommand.requestFocus()
             val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
             imm.showSoftInput(binding.etCommand, InputMethodManager.SHOW_IMPLICIT)
+            binding.layoutCommandBar.requestApplyInsetsWhenReady()
         }
 
         override fun onHandoff(reason: String) {
@@ -737,12 +806,58 @@ class WebBrowserActivity : AppCompatActivity() {
         agent?.resumeAfterHandoff()
     }
 
+    /**
+     * The user finished the login/CAPTCHA on the page loaded above (see
+     * [showGlassHandoffIfWaiting]). Clears the off-screen engine's wait state
+     * and restores the normal Stop button, but does not itself resume the
+     * interrupted voice goal — that still happens when the user tells the
+     * glasses "continue" (routed to [GlassBrowserTools.resume]), now against a
+     * genuinely-resolved page instead of the same block.
+     */
+    private fun continueGlassHandoff() {
+        isShowingGlassHandoff = false
+        binding.btnAgentStop.text = "Stop"
+        GlassBrowserEngine.resume()
+        showAgentStrip(
+            "Done — say \"continue\" to your glasses to carry on.",
+            showStop = false,
+            showContinue = false,
+            busy = false
+        )
+        binding.layoutAgentStatus.postDelayed({
+            if (agent?.isRunning != true) binding.layoutAgentStatus.visibility = View.GONE
+        }, RESULT_LINGER_MS)
+    }
+
+    /**
+     * Gives up on the interrupted goal entirely instead of leaving the glasses
+     * permanently blocked on it (see [GlassBrowserEngine.cancel] — previously
+     * defined but never called from any voice/UI path, so a stuck state that
+     * the user did not want to resolve had no way out at all).
+     */
+    private fun cancelGlassHandoff() {
+        isShowingGlassHandoff = false
+        binding.btnAgentStop.text = "Stop"
+        GlassBrowserEngine.cancel()
+        showAgentStrip("Cancelled.", showStop = false, showContinue = false, busy = false)
+        binding.layoutAgentStatus.postDelayed({
+            if (agent?.isRunning != true) binding.layoutAgentStatus.visibility = View.GONE
+        }, RESULT_LINGER_MS)
+    }
+
     private fun showAgentStrip(
         message: String,
         showStop: Boolean,
         showContinue: Boolean,
         busy: Boolean = true
     ) {
+        // Any caller other than the glass-handoff functions above is the
+        // on-screen agent's own status; don't leave Stop/Continue wired to
+        // the glasses' handoff once that strip has been replaced.
+        if (isShowingGlassHandoff) {
+            isShowingGlassHandoff = false
+            binding.btnAgentStop.text = "Stop"
+        }
         binding.layoutAgentStatus.visibility = View.VISIBLE
         binding.tvAgentStatus.text = message
         binding.progressAgent.visibility = if (busy) View.VISIBLE else View.GONE
@@ -787,11 +902,21 @@ class WebBrowserActivity : AppCompatActivity() {
     private fun speakRepliesEnabled(): Boolean = prefs().getBoolean(KEY_SPEAK, true)
 
     /**
-     * Hands-free mode. Off by default: a mis-heard sentence shouldn't send the
-     * agent off across live pages, so the user reviews a spoken goal before it
-     * runs. Answers to the agent's own questions bypass this either way.
+     * Hands-free mode: a spoken command runs immediately instead of just
+     * filling the command box and waiting for a manual tap on send.
+     *
+     * On by default. It used to default off specifically so a mis-heard
+     * sentence couldn't send the agent off across a live page unreviewed -
+     * but in practice that made the mic feel broken: speaking a command
+     * appeared to do nothing (it silently populated the text box while
+     * showing a "check the command, then tap send" toast easy to miss), which
+     * is what "the mic isn't working" and "assign a task and it should just
+     * do it, step by step" were really describing. The menu's "Review voice
+     * commands" option still lets a user opt back into the old reviewed
+     * behavior. Answers to the agent's own questions always run immediately
+     * either way, regardless of this setting.
      */
-    private fun autoRunVoice(): Boolean = prefs().getBoolean(KEY_AUTO_RUN, false)
+    private fun autoRunVoice(): Boolean = prefs().getBoolean(KEY_AUTO_RUN, true)
 
     // ----------------------------------------------------------- back / state
 
@@ -829,18 +954,44 @@ class WebBrowserActivity : AppCompatActivity() {
 
     /**
      * The glasses tell the user to open this screen when they hit a login or a
-     * security check. Say so here too, so arriving on the phone explains itself
-     * instead of showing a bare browser.
+     * security check. That block happens on [GlassBrowserEngine]'s own
+     * off-screen WebView — invisible and never attached to any window — so
+     * previously the user had nothing to look at or tap here: the visible
+     * browser just showed whatever page it already had open, and "continue"
+     * from the glasses re-hit the same unsolved block forever.
+     *
+     * Fixed by loading the exact URL the off-screen engine is stuck on into
+     * *this* visible WebView (they share the same cookie jar via
+     * [WebSessionManager], so solving it here — logging in, ticking the
+     * CAPTCHA — actually clears the block for the off-screen session too),
+     * and by giving the user a real "Continue"/"Cancel" here instead of only
+     * a voice command, since the glasses may not be worn at this point.
      */
     private fun showGlassHandoffIfWaiting() {
         val reason = GlassBrowserEngine.pendingReason ?: return
+
         showAgentStrip(
-            "$reason Finish it here, then tell your glasses to continue.",
+            "$reason Finish it above, then tap Continue.",
             showStop = false,
-            showContinue = false,
+            showContinue = true,
             busy = false
         )
+        // showAgentStrip() resets this flag for its own (on-screen agent) use,
+        // so it must be set AFTER calling it, not before.
+        isShowingGlassHandoff = true
+        binding.btnAgentStop.visibility = View.VISIBLE
+        binding.btnAgentStop.text = "Cancel"
+
+        lifecycleScope.launch {
+            val stuckUrl = GlassBrowserEngine.currentUrl()
+            if (!stuckUrl.isNullOrBlank() && binding.webView.url != stuckUrl) {
+                loadUrl(stuckUrl)
+            }
+        }
     }
+
+    /** True while the strip above is showing the glasses' handoff, not the on-screen agent's. */
+    private var isShowingGlassHandoff = false
 
     override fun onDestroy() {
         // The agent drives the WebView, so it must stop before the WebView goes.
@@ -892,6 +1043,9 @@ class WebBrowserActivity : AppCompatActivity() {
 
         private const val RESULT_LINGER_MS = 9000L
         private const val ERROR_LINGER_MS = 6000L
+
+        /** How long the keyboard's own show animation typically takes to settle. */
+        private const val IME_SETTLE_MS = 260L
 
         /** Give an AI service time to render its client-side history list. */
         private const val SERVICE_LOAD_MS = 4500L

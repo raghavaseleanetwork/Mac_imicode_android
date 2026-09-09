@@ -20,7 +20,8 @@ class QuickNotesAdapter(
     private var items: List<ListItem>,
     private val onClick: (QuickNote) -> Unit,
     private val onEdit: (QuickNote) -> Unit,
-    private val onCopy: (QuickNote) -> Unit
+    private val onCopy: (QuickNote) -> Unit,
+    private val onDelete: (QuickNote) -> Unit
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
     /** A row in the list is either a month header or a note (self or AI styled). */
@@ -89,12 +90,17 @@ class QuickNotesAdapter(
                 h.tvTimestamp.text = item.note.getShortDate()
                 h.divider.visibility = if (item.isLastInGroup) View.GONE else View.VISIBLE
                 h.card.setOnClickListener { onClick(item.note) }
+                // Long-press to delete without having to open the note first —
+                // matches the standard Android list pattern, and there was
+                // previously no delete path anywhere in Quick Notes at all.
+                h.card.setOnLongClickListener { onDelete(item.note); true }
             }
             is ListItem.AiNote -> {
                 val h = holder as AiViewHolder
                 h.tvTitle.text = item.note.title
                 h.tvContent.text = item.note.content
                 h.card.setOnClickListener { onClick(item.note) }
+                h.card.setOnLongClickListener { onDelete(item.note); true }
                 h.btnEdit.setOnClickListener { onEdit(item.note) }
                 h.btnCopy.setOnClickListener { onCopy(item.note) }
             }

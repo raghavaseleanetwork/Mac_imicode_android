@@ -361,9 +361,37 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
                     Log.i(TAG, "❌ Glasses not detected after $maxAttempts attempts")
                     binding.layoutBleChecking.visibility = View.GONE
                     binding.layoutBleNotConnected.visibility = View.VISIBLE
+                    showBleGateReason()
                 }
             }
         }, intervalMs)
+    }
+
+    /**
+     * Distinguishes "Bluetooth itself is off" from "glasses aren't paired or
+     * are out of range" on the gate screen.
+     *
+     * Both cases used to show the identical "no device / Connect your IMI
+     * glasses via your phone's Bluetooth settings" message, which is
+     * misleading when the actual problem is that Bluetooth is switched off
+     * entirely - that instruction reads like a pairing/range issue, not "turn
+     * Bluetooth on first".
+     */
+    private fun showBleGateReason() {
+        val bluetoothOff = BluetoothAdapter.getDefaultAdapter()?.isEnabled != true
+        if (bluetoothOff) {
+            binding.tvBleGateHeadline.text = "bluetooth off"
+            binding.tvBleGateTitle.text = "off."
+            binding.tvBleGateDescription.text =
+                "Bluetooth is turned off on this phone. Turn it on to connect your IMI glasses, then tap Retry."
+            binding.btnBleGateRetry.text = "Open Bluetooth Settings"
+        } else {
+            binding.tvBleGateHeadline.text = "no device"
+            binding.tvBleGateTitle.text = "connected."
+            binding.tvBleGateDescription.text =
+                "Connect your IMI glasses via your phone's Bluetooth settings, then tap Retry."
+            binding.btnBleGateRetry.text = "Retry"
+        }
     }
 
     /**
@@ -589,7 +617,10 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
             // the gap. (The old 0.27 was tuned for the previous, weaker model
             // whose positives only reached ≈0.39 — do NOT reintroduce it.)
             setThreshold(HeyImiWakeWordDetector.DEFAULT_THRESHOLD) // 0.55, matches iOS
-            start()
+            // Listen on the GLASSES mic, not the phone's — preWarmWakeWord()
+            // leaves the preference false and nothing set it back, so every
+            // session was running on the phone mic.
+            armOnGlassMic()
         }
     }
 
@@ -913,18 +944,28 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         }
 
         binding.btnBleGateRetry.setOnClickListener {
-            // If BLUETOOTH_CONNECT is still missing we literally cannot see the
-            // glasses, so ask for it again rather than re-running a check that is
-            // guaranteed to fail.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    this, arrayOf(Manifest.permission.BLUETOOTH_CONNECT), REQUEST_PERMISSIONS
-                )
-            } else {
-                checkBleAndShowGate()
+            when {
+                // Bluetooth itself is off: re-running the check would just
+                // fail again in the same way, so send the user straight to
+                // the settings screen that actually fixes it.
+                BluetoothAdapter.getDefaultAdapter()?.isEnabled != true -> {
+                    try {
+                        startActivity(Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS))
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Couldn't open Bluetooth settings: ${e.message}")
+                    }
+                }
+                // If BLUETOOTH_CONNECT is still missing we literally cannot see the
+                // glasses, so ask for it again rather than re-running a check that is
+                // guaranteed to fail.
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+                    != PackageManager.PERMISSION_GRANTED -> {
+                    ActivityCompat.requestPermissions(
+                        this, arrayOf(Manifest.permission.BLUETOOTH_CONNECT), REQUEST_PERMISSIONS
+                    )
+                }
+                else -> checkBleAndShowGate()
             }
         }
 
@@ -1047,6 +1088,15 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
                 hideBleGate()
             }
             BluetoothEvent.EventType.DISCONNECTED -> {
+                // MainActivity (Mark 2) already toasts this (see
+                // MainActivity.kt's own BluetoothEvent handler); Mark 1 only
+                // silently swapped in the full-screen gate, with no
+                // lightweight feedback if that gate happened to be skipped
+                // (e.g. a background conversation was active and
+                // checkBleAndShowGate() handed off to the locked-phone UI
+                // instead) - so a disconnect could pass with zero visible
+                // indication at all.
+                Toast.makeText(this, "Glasses disconnected", Toast.LENGTH_SHORT).show()
                 if (isGeminiLiveActive) stopConversation()
                 checkBleAndShowGate()
             }
@@ -1137,6 +1187,9 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
         Log.d(TAG, "Tool call: $toolName args=$args")
         return when (toolName) {
             "create_note" -> handleCreateNote(args)
+            "delete_note" ->
+                "I can't delete notes by voice. Open Quick Notes and delete it there — " +
+                    "tap and hold a note, or open it and tap the delete icon."
             "start_meeting" -> handleStartMeeting()
             "play_music" -> handlePlayMusic(args)
             "play_youtube" -> handlePlayYoutube(args)
@@ -1185,7 +1238,13 @@ class Mark1MainActivity : AppCompatActivity(), GeminiLiveService.GeminiLiveCallb
     override fun onError(error: String) {
         Log.e(TAG, "GeminiLive error: $error")
         runOnUiThread {
-            Toast.makeText(this, "Connection error — tap Quick Start to retry", Toast.LENGTH_SHORT).show()
+            // Used to always show a hardcoded "Connection error" regardless of
+            // cause, so "no internet", a revoked API key, and a quota
+            // rejection all looked identical - which is exactly what made "no
+            // internet" unrecognizable as such. GeminiLiveService already
+            // classifies the real cause (see its onError callers); show that
+            // instead, same as MainActivity's equivalent handler does.
+            Toast.makeText(this, "$error — tap Quick Start to retry", Toast.LENGTH_LONG).show()
             stopConversation()
         }
     }

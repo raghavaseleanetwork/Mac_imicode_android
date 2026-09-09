@@ -54,8 +54,14 @@ class WebAgentPlanner(private val context: Context?) {
            invent a selector.
         2. NEVER type into a field marked [SENSITIVE]. Never type passwords,
            OTPs, card numbers or PINs anywhere. For those, use "handoff".
-        3. If the page shows a login screen or a CAPTCHA, use "handoff" and
-           explain what the user should do.
+        3. If the CURRENT page shows a login screen or a CAPTCHA and the goal
+           actually requires using THIS page (reading it, clicking something on
+           it, submitting a form on it), use "handoff" and explain what the
+           user should do. But if the goal is to go somewhere else entirely
+           (e.g. goal is "open YouTube" but the current page happens to be some
+           other site's login/CAPTCHA screen), just "open" or "search" to the
+           site the goal actually asks for - leaving an unrelated blocked page
+           needs no handoff, since you are not interacting with it.
         4. If you need information only the user has (an address, a date, a
            choice between options), use "ask_user" with one clear question.
         5. Prefer "search" over hunting for a site's own search box.
